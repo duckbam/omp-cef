@@ -338,6 +338,29 @@ void __fastcall ChatHook::Hook_AddEntry(void* pThis, void* _edx, int type, const
     KickRepaint();
 }
 
+namespace
+{
+    // The native chat has a scroll bar control (CChat+0x11E) drawn by the game's dialog code, not by
+    // CChat::Render/Draw. VERIFIED against the 0.3.DL-R1 samp.dll (entry 0xFDB60): its vtable is at
+    // RVA 0x11D550, slot +0x40 is SetVisible(bool) = `mov [ecx+4], al`, and the control's Render
+    // (RVA 0x884D0) draws nothing when that byte is 0. CChat::Draw (RVA 0x67870) is the only code that
+    // turns it back on each frame, and we skip Draw, so setting it once per frame is enough.
+    bool HideScrollbarGuarded(void* scrollbar)
+    {
+        __try
+        {
+            void** vtable = *reinterpret_cast<void***>(scrollbar);
+            using FnSetVisible = void(__thiscall*)(void*, bool);
+            reinterpret_cast<FnSetVisible>(vtable[16])(scrollbar, false);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+}
+
 void __fastcall ChatHook::Hook_ChatRender(void* pThis, void* _edx)
 {
     // With the patched client the native chat is not drawn at all (the CEF chat shows every line).
@@ -382,6 +405,22 @@ void ChatHook::Tick()
             replay.assign(s_replay_requests_.begin(), s_replay_requests_.end());
             s_replay_requests_.clear();
             history = s_history_;
+        }
+    }
+
+    // Keep the native chat scroll bar hidden (a one-byte write; re-done each frame in case the
+    // control was recreated after a device reset).
+    if (auto* chat = sampapi::v03dl::RefChat())
+    {
+        if (chat->m_pScrollbar)
+        {
+            static bool s_logged = false;
+            const bool ok = HideScrollbarGuarded(chat->m_pScrollbar);
+            if (!s_logged)
+            {
+                LOG_INFO("[ChatHook] Hide native scrollbar: {}", ok ? "ok" : "FAILED");
+                s_logged = true;
+            }
         }
     }
 
