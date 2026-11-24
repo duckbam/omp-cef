@@ -98,13 +98,8 @@ bool ChatHook::Initialize()
         else
             LOG_ERROR("[ChatHook] Failed to install AddEntry hook (CEF chat disabled).");
 
-        if (hooks_.Install("ChatHook::ChatRender", base + 0x673B0, reinterpret_cast<void*>(&Hook_ChatRender)))
-            s_orig_render_ = reinterpret_cast<FnChatRender>(hooks_.GetOriginal("ChatHook::ChatRender"));
-        else
-            LOG_ERROR("[ChatHook] Failed to install ChatRender hook (CEF chat disabled).");
-
-        LOG_INFO("[ChatHook] Chat bridge hooks: AddEntry={} Render={}",
-                 s_orig_add_entry_ != nullptr, s_orig_render_ != nullptr);
+        s_bridge_enabled_ = (s_orig_add_entry_ != nullptr);
+        LOG_INFO("[ChatHook] Chat bridge enabled={}", s_bridge_enabled_);
     }
 
     return true;
@@ -115,9 +110,8 @@ void ChatHook::Shutdown()
     hooks_.Uninstall("ChatHook::OpenChatInput");
     hooks_.Uninstall("ChatHook::CloseChatInput");
     hooks_.Uninstall("ChatHook::AddEntry");
-    hooks_.Uninstall("ChatHook::ChatRender");
+    s_bridge_enabled_ = false;
     s_orig_add_entry_ = nullptr;
-    s_orig_render_ = nullptr;
     s_orig_open_ = nullptr;
     s_orig_close_ = nullptr;
     s_self_ = nullptr;
@@ -228,6 +222,9 @@ namespace
 
 void ChatHook::QueueSubmit(const std::string& utf8_text)
 {
+    if (!s_bridge_enabled_)
+        return;
+
     std::lock_guard<std::mutex> lock(s_mutex_);
     if (s_pending_input_.size() < 32)
         s_pending_input_.push_back(utf8_text);
@@ -235,6 +232,9 @@ void ChatHook::QueueSubmit(const std::string& utf8_text)
 
 void ChatHook::RegisterChatBrowser(int browser_id)
 {
+    if (!s_bridge_enabled_)
+        return;
+
     std::lock_guard<std::mutex> lock(s_mutex_);
     s_chat_browsers_.insert(browser_id);
     s_replay_requests_.insert(browser_id);   // history is replayed on the game thread
@@ -301,37 +301,54 @@ void __fastcall ChatHook::Hook_AddEntry(void* pThis, void* _edx, int type, const
     self->ForwardEntry(line);
 }
 
-void __fastcall ChatHook::Hook_ChatRender(void* pThis, void* _edx)
+void ChatHook::Tick()
 {
     auto* self = s_self_;
-    bool cef_chat_active = false;
+    if (!self || !s_bridge_enabled_)
+        return;
 
-    if (self)
+    // Forget chat browsers that no longer exist.
+    std::vector<int> ids;
     {
-        // Game thread: safe place to touch SA-MP structures.
-        std::vector<int> replay;
-        std::deque<ChatLine> history;
+        std::lock_guard<std::mutex> lock(s_mutex_);
+        ids.assign(s_chat_browsers_.begin(), s_chat_browsers_.end());
+    }
+    for (const int id : ids)
+    {
+        auto* inst = self->browser_.GetBrowserInstance(id);
+        if (!inst || !inst->browser)
         {
             std::lock_guard<std::mutex> lock(s_mutex_);
-            cef_chat_active = !s_chat_browsers_.empty();
-            if (!s_replay_requests_.empty())
-            {
-                replay.assign(s_replay_requests_.begin(), s_replay_requests_.end());
-                s_replay_requests_.clear();
-                history = s_history_;
-            }
+            s_chat_browsers_.erase(id);
         }
-
-        for (const int id : replay)
-            for (const auto& line : history)
-                self->ForwardEntry(line, id);
-
-        self->ProcessPendingInput();
     }
 
-    // Native chat is not drawn while a CEF chat is showing it.
-    if (!cef_chat_active && s_orig_render_)
-        s_orig_render_(pThis, _edx);
+    std::vector<int> replay;
+    std::deque<ChatLine> history;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex_);
+        if (!s_replay_requests_.empty())
+        {
+            replay.assign(s_replay_requests_.begin(), s_replay_requests_.end());
+            s_replay_requests_.clear();
+            history = s_history_;
+        }
+    }
+
+    // With the patched client the native chat is never shown (display mode "off"), from the moment
+    // the game starts, so the "Connecting..." lines are not drawn natively either. Every line is still
+    // kept in s_history_ and shown in the CEF chat as soon as it registers.
+    if (auto* chat = sampapi::v03dl::RefChat())
+    {
+        if (chat->m_nMode != sampapi::v03dl::CChat::DISPLAY_MODE_OFF)
+            chat->m_nMode = sampapi::v03dl::CChat::DISPLAY_MODE_OFF;
+    }
+
+    for (const int id : replay)
+        for (const auto& line : history)
+            self->ForwardEntry(line, id);
+
+    self->ProcessPendingInput();
 }
 
 void ChatHook::ProcessPendingInput()

@@ -33,6 +33,9 @@ public:
     static void QueueSubmit(const std::string& utf8_text);
     // A browser announced it renders the chat: replay history to it.
     static void RegisterChatBrowser(int browser_id);
+    // Once per frame on the game thread (App::Tick): keeps the native chat hidden,
+    // replays history to new chat browsers, runs queued input.
+    static void Tick();
 
 private:
     using FnOpenChatInput = void(__fastcall*)(void* pThis, void* _edx);
@@ -49,10 +52,6 @@ private:
                                          const char* prefix, unsigned long textColor, unsigned long prefixColor);
     static void __fastcall Hook_AddEntry(void* pThis, void* _edx, int type, const char* text,
                                          const char* prefix, unsigned long textColor, unsigned long prefixColor);
-
-    // CChat::Render() : native chat drawing. Skipped while a CEF chat is registered.
-    using FnChatRender = void(__fastcall*)(void* pThis, void* _edx);
-    static void __fastcall Hook_ChatRender(void* pThis, void* _edx);
 
     struct ChatLine
     {
@@ -77,7 +76,7 @@ private:
     static inline FnOpenChatInput s_orig_open_ = nullptr;
     static inline FnCloseChatInput s_orig_close_ = nullptr;
     static inline FnAddEntry s_orig_add_entry_ = nullptr;
-    static inline FnChatRender s_orig_render_ = nullptr;
+    static inline bool s_bridge_enabled_ = false;   // true only on 0.3.DL-R1 with the AddEntry hook installed
 
     static inline std::mutex s_mutex_;
     static inline std::deque<std::string> s_pending_input_;   // UTF-8, from the CEF side
