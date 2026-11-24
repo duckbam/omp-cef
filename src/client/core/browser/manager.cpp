@@ -1806,6 +1806,33 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 return false;
             }
 
+            // Non-ASCII text (Hangul etc.): commit it as text instead of a key event.
+            // As a key event the UTF-16 code is truncated to its low byte somewhere in the key
+            // pipeline, so syllables like U+C608 (low byte 0x08) acted as Backspace.
+            if (msg == WM_CHAR && wParam > 0x7F)
+            {
+                static wchar_t pending_high = 0;
+                const wchar_t ch = static_cast<wchar_t>(wParam);
+                std::wstring text;
+                if (IS_HIGH_SURROGATE(ch))
+                {
+                    pending_high = ch;
+                    return true;
+                }
+                if (IS_LOW_SURROGATE(ch) && pending_high)
+                {
+                    text.push_back(pending_high);
+                    text.push_back(ch);
+                }
+                else
+                {
+                    text.push_back(ch);
+                }
+                pending_high = 0;
+                host->ImeCommitText(CefString(text), CefRange(UINT32_MAX, UINT32_MAX), 0);
+                return true;
+            }
+
             CefKeyEvent evt;
             evt.windows_key_code = static_cast<int>(wParam);
             evt.native_key_code = static_cast<int>(lParam);
