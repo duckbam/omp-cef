@@ -1,4 +1,13 @@
 
+## [1.3.2](https://github.com/aurora-mp/omp-cef/compare/v1.3.1..v1.3.2) (2026-11-24)
+
+### 🧹 Chore
+
+- Update CHANGELOG for v1.3.1 - ([3eb5ab2](https://github.com/aurora-mp/omp-cef/commit/3eb5ab26f475c27951d98cb0237ecb3a89d732c6))
+
+
+
+
 ## [1.3.1](https://github.com/aurora-mp/omp-cef/compare/v1.4.1..v1.3.1) (2026-11-24)
 
 
