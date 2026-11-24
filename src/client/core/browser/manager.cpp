@@ -1668,11 +1668,57 @@ void BrowserManager::OnDeviceReset(IDirect3DDevice9* device)
     
     // Resume CEF updates
     isCefUpdatesPaused_ = false;
+
+    // The textures were just recreated empty and CEF only repaints dirty regions.
+    ForceRepaintAll();
+}
+
+void BrowserManager::ForceRepaintAll()
+{
+    // CEF only repaints dirty regions, so a static page (e.g. the chat) can stay blank after the
+    // game window was minimized / alt-tabbed / the device was reset, until its content changes.
+    std::vector<CefRefPtr<CefBrowser>> to_repaint;
+    for (auto& [id, instance] : browsers_)
+        if (instance && instance->browser && instance->visible)
+            to_repaint.push_back(instance->browser);
+
+    if (to_repaint.empty())
+        return;
+
+    CefPostTask(TID_UI, base::BindOnce([](std::vector<CefRefPtr<CefBrowser>> list) {
+        for (auto& b : list)
+            if (auto host = b->GetHost())
+            {
+                host->WasHidden(false);
+                host->WasResized();
+                host->Invalidate(PET_VIEW);
+            }
+    }, std::move(to_repaint)));
 }
 
 LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     bool native_ui_message_consumed = false;
+
+    // Coming back to the game (restore from minimize, alt-tab, desktop, window focus): repaint all.
+    switch (msg)
+    {
+    case WM_ACTIVATEAPP:
+    case WM_ACTIVATE:
+        if (wParam) ForceRepaintAll();
+        break;
+    case WM_SETFOCUS:
+        ForceRepaintAll();
+        break;
+    case WM_SIZE:
+        if (wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED) ForceRepaintAll();
+        break;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_RESTORE) ForceRepaintAll();
+        break;
+    default:
+        break;
+    }
 
     native_ui_message_consumed = escape_menu_.ConsumeWndProcMessage(msg, wParam, lParam) || native_ui_message_consumed;
 

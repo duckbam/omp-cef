@@ -197,6 +197,7 @@ public:
 
     void OnDeviceLost();
     void OnDeviceReset(IDirect3DDevice9* device);
+    void ForceRepaintAll();
 
 private:
     void CreateBrowserInternal(int id, const std::string& url, bool focused, bool controls_chat, float width, float height);
