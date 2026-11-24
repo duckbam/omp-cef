@@ -121,7 +121,11 @@ void ChatHook::SetChatInputState(bool open)
 {
     // Avoid redundant notifications
     if (focus_.IsChatInputOpen() == open)
+    {
+        LOG_INFO("[ChatHook] SetChatInputState({}) ignored: already in that state", open);
         return;
+    }
+    LOG_INFO("[ChatHook] SetChatInputState({})", open);
 
     focus_.SetChatInputOpen(open);
 
@@ -155,13 +159,18 @@ void __fastcall ChatHook::Hook_OpenChatInput(void* pThis, void* _edx)
         return;
 
     if (self->focus_.ShouldBlockChat())
+    {
+        LOG_INFO("[ChatHook] Open requested but ShouldBlockChat()=true");
         return;
+    }
 
     bool cef_chat_active = false;
     {
         std::lock_guard<std::mutex> lock(s_mutex_);
         cef_chat_active = !s_chat_browsers_.empty();
     }
+
+    LOG_INFO("[ChatHook] Open requested: cef_chat_active={}", cef_chat_active);
 
     // With a CEF chat registered the native input box stays closed: the CEF
     // page shows its own input when it receives chatInputState(true).
@@ -225,6 +234,7 @@ void ChatHook::QueueSubmit(const std::string& utf8_text)
     if (!s_bridge_enabled_)
         return;
 
+    LOG_INFO("[ChatHook] QueueSubmit len={}", utf8_text.size());
     std::lock_guard<std::mutex> lock(s_mutex_);
     if (s_pending_input_.size() < 32)
         s_pending_input_.push_back(utf8_text);
@@ -235,6 +245,7 @@ void ChatHook::RegisterChatBrowser(int browser_id)
     if (!s_bridge_enabled_)
         return;
 
+    LOG_INFO("[ChatHook] RegisterChatBrowser id={}", browser_id);
     std::lock_guard<std::mutex> lock(s_mutex_);
     s_chat_browsers_.insert(browser_id);
     s_replay_requests_.insert(browser_id);   // history is replayed on the game thread
@@ -361,6 +372,7 @@ void ChatHook::ProcessPendingInput()
         batch.swap(s_pending_input_);
     }
 
+    LOG_INFO("[ChatHook] ProcessPendingInput: {} item(s)", batch.size());
     for (const auto& utf8 : batch)
     {
         // Special marker from the page: "close without sending".
@@ -383,6 +395,7 @@ void ChatHook::DispatchInput(const std::string& text)
     if (text.empty())
         return;
 
+    LOG_INFO("[ChatHook] DispatchInput '{}'", text);
     using namespace sampapi::v03dl;
 
     CInput* input = RefInputBox();
@@ -410,13 +423,13 @@ void ChatHook::DispatchInput(const std::string& text)
         {
             if (input->m_pCommandProc[i] && ::lstrcmpiA(input->m_szCommandName[i], name) == 0)
             {
-                LOG_DEBUG("[ChatHook] client command '{}'", name);
+                LOG_INFO("[ChatHook] client command '{}'", name);
                 input->m_pCommandProc[i](args);
                 return;
             }
         }
 
-        LOG_DEBUG("[ChatHook] server command '{}'", name);
+        LOG_INFO("[ChatHook] server command '{}'", name);
         input->Send(text.c_str());
         return;
     }
@@ -424,6 +437,7 @@ void ChatHook::DispatchInput(const std::string& text)
     auto* netgame = RefNetGame();
     auto* players = netgame ? netgame->GetPlayerPool() : nullptr;
     auto* local = players ? players->GetLocalPlayer() : nullptr;
+    LOG_INFO("[ChatHook] plain chat, local player={}", local != nullptr);
     if (local)
         local->Chat(text.c_str());
 }
