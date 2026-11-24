@@ -102,6 +102,16 @@ bool ChatHook::Initialize()
         else
             LOG_ERROR("[ChatHook] Failed to install AddEntry hook (CEF chat disabled).");
 
+        if (hooks_.Install("ChatHook::ChatRender", base + 0x673B0, reinterpret_cast<void*>(&Hook_ChatRender)))
+            s_orig_render_ = reinterpret_cast<FnChatDraw>(hooks_.GetOriginal("ChatHook::ChatRender"));
+        else
+            LOG_ERROR("[ChatHook] Failed to install ChatRender hook.");
+
+        if (hooks_.Install("ChatHook::ChatDraw", base + 0x67870, reinterpret_cast<void*>(&Hook_ChatDraw)))
+            s_orig_draw_ = reinterpret_cast<FnChatDraw>(hooks_.GetOriginal("ChatHook::ChatDraw"));
+        else
+            LOG_ERROR("[ChatHook] Failed to install ChatDraw hook.");
+
         s_bridge_enabled_ = (s_orig_add_entry_ != nullptr);
         LOG_INFO("[ChatHook] Chat bridge enabled={}", s_bridge_enabled_);
     }
@@ -114,6 +124,10 @@ void ChatHook::Shutdown()
     hooks_.Uninstall("ChatHook::OpenChatInput");
     hooks_.Uninstall("ChatHook::CloseChatInput");
     hooks_.Uninstall("ChatHook::AddEntry");
+    hooks_.Uninstall("ChatHook::ChatRender");
+    hooks_.Uninstall("ChatHook::ChatDraw");
+    s_orig_render_ = nullptr;
+    s_orig_draw_ = nullptr;
     s_bridge_enabled_ = false;
     s_orig_add_entry_ = nullptr;
     s_orig_open_ = nullptr;
@@ -324,6 +338,19 @@ void __fastcall ChatHook::Hook_AddEntry(void* pThis, void* _edx, int type, const
     KickRepaint();
 }
 
+void __fastcall ChatHook::Hook_ChatRender(void* pThis, void* _edx)
+{
+    // With the patched client the native chat is not drawn at all (the CEF chat shows every line).
+    if (!s_bridge_enabled_ && s_orig_render_)
+        s_orig_render_(pThis, _edx);
+}
+
+void __fastcall ChatHook::Hook_ChatDraw(void* pThis, void* _edx)
+{
+    if (!s_bridge_enabled_ && s_orig_draw_)
+        s_orig_draw_(pThis, _edx);
+}
+
 void ChatHook::Tick()
 {
     auto* self = s_self_;
@@ -356,15 +383,6 @@ void ChatHook::Tick()
             s_replay_requests_.clear();
             history = s_history_;
         }
-    }
-
-    // With the patched client the native chat is never shown (display mode "off"), from the moment
-    // the game starts, so the "Connecting..." lines are not drawn natively either. Every line is still
-    // kept in s_history_ and shown in the CEF chat as soon as it registers.
-    if (auto* chat = sampapi::v03dl::RefChat())
-    {
-        if (chat->m_nMode != sampapi::v03dl::CChat::DISPLAY_MODE_OFF)
-            chat->m_nMode = sampapi::v03dl::CChat::DISPLAY_MODE_OFF;
     }
 
     for (const int id : replay)

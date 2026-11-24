@@ -54,6 +54,12 @@ private:
     static void __fastcall Hook_AddEntry(void* pThis, void* _edx, int type, const char* text,
                                          const char* prefix, unsigned long textColor, unsigned long prefixColor);
 
+    // CChat::Render() and CChat::Draw(): the native chat drawing. Skipped (the CEF chat shows the lines).
+    // The display mode is NOT touched: "off" also hides the minimap and HUD.
+    using FnChatDraw = void(__fastcall*)(void* pThis, void* _edx);
+    static void __fastcall Hook_ChatRender(void* pThis, void* _edx);
+    static void __fastcall Hook_ChatDraw(void* pThis, void* _edx);
+
     struct ChatLine
     {
         int type = 0;
@@ -81,6 +87,8 @@ private:
     static inline FnCloseChatInput s_orig_close_ = nullptr;
     static inline FnAddEntry s_orig_add_entry_ = nullptr;
     static inline std::atomic<int> s_kick_frames_{ 0 };
+    static inline FnChatDraw s_orig_render_ = nullptr;
+    static inline FnChatDraw s_orig_draw_ = nullptr;
     static inline bool s_bridge_enabled_ = false;   // true only on 0.3.DL-R1 with the AddEntry hook installed
 
     static inline std::mutex s_mutex_;
