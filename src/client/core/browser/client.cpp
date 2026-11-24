@@ -1,4 +1,5 @@
 #include "client.hpp"
+#include "samp/hooks/chat.hpp"
 
 #include <vector>
 
@@ -177,6 +178,25 @@ bool BrowserClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser*/,
                 bool has_focus = args->GetBool(1);
                 focus_->SetInputFocus(browserId_, has_focus);
             }
+            return true;
+        }
+
+        // Client-only chat bridge (never sent to the server)
+        // JS: cef.emit('chat:ready')            -> this browser renders the chat; replay history
+        // JS: cef.emit('chat:submit', text)     -> run text like SA-MP's own input box ("" = just close)
+        if (event_name == "chat:ready")
+        {
+            ChatHook::RegisterChatBrowser(browserId_);
+            return true;
+        }
+
+        if (event_name == "chat:submit")
+        {
+            std::string text;
+            if (args->GetSize() > 1 && args->GetType(1) == VTYPE_STRING)
+                text = args->GetString(1).ToString();
+
+            ChatHook::QueueSubmit(text);
             return true;
         }
 
