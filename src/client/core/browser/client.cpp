@@ -8,6 +8,7 @@
 #include "browser/audio.hpp"
 #include "browser/focus.hpp"
 #include "browser/manager.hpp"
+#include "system/logger.hpp"
 #include "network/network_manager.hpp"
 
 static inline std::string ToLower(std::string s)
@@ -187,6 +188,13 @@ bool BrowserClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser*/,
         if (event_name == "chat:ready")
         {
             ChatHook::RegisterChatBrowser(browserId_);
+            return true;
+        }
+
+        if (event_name == "chat:log")
+        {
+            if (args->GetSize() > 1 && args->GetType(1) == VTYPE_STRING)
+                LOG_INFO("[ChatPage] {}", args->GetString(1).ToString());
             return true;
         }
 
