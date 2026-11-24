@@ -14,6 +14,7 @@
 #include "ui/hud_manager.hpp"
 #include "system/logger.hpp"
 #include "samp/components/chat.hpp"
+#include "samp/hooks/chat.hpp"
 #include "samp/components/netgame.hpp"
 #include "samp/common.hpp"
 #include "utf8.hpp"
@@ -285,6 +286,7 @@ void App::Tick()
     focus_.Update();
     browser_.TickGameData();
     browser_.RenderAll();
+    ChatHook::Tick();
     
     if (pending_clear_chat_)
     {
