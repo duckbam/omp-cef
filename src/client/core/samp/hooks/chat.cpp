@@ -11,6 +11,15 @@
 #include "shared/events.hpp"
 #include "utf8.hpp"
 
+#include <sampapi/0.3.DL-1/CChat.h>
+#include <sampapi/0.3.DL-1/CInput.h>
+#include <sampapi/0.3.DL-1/CLocalPlayer.h>
+#include <sampapi/0.3.DL-1/CNetGame.h>
+#include <sampapi/0.3.DL-1/CPlayerPool.h>
+
+#include <algorithm>
+#include <cstring>
+
 bool ChatHook::Initialize()
 {
     s_self_ = this;
@@ -79,6 +88,25 @@ bool ChatHook::Initialize()
 
     LOG_DEBUG("[ChatHook] OpenChatInput hook installed.");
     LOG_DEBUG("[ChatHook] CloseChatInput hook installed.");
+
+    // CEF chat bridge: only 0.3.DL-R1 for now. Failures are non-fatal; the
+    // native chat keeps working untouched.
+    if (addrs.Version() == SampVersion::V03DLR1)
+    {
+        if (hooks_.Install("ChatHook::AddEntry", base + 0x67650, reinterpret_cast<void*>(&Hook_AddEntry)))
+            s_orig_add_entry_ = reinterpret_cast<FnAddEntry>(hooks_.GetOriginal("ChatHook::AddEntry"));
+        else
+            LOG_ERROR("[ChatHook] Failed to install AddEntry hook (CEF chat disabled).");
+
+        if (hooks_.Install("ChatHook::ChatRender", base + 0x673B0, reinterpret_cast<void*>(&Hook_ChatRender)))
+            s_orig_render_ = reinterpret_cast<FnChatRender>(hooks_.GetOriginal("ChatHook::ChatRender"));
+        else
+            LOG_ERROR("[ChatHook] Failed to install ChatRender hook (CEF chat disabled).");
+
+        LOG_INFO("[ChatHook] Chat bridge hooks: AddEntry={} Render={}",
+                 s_orig_add_entry_ != nullptr, s_orig_render_ != nullptr);
+    }
+
     return true;
 }
 
@@ -86,6 +114,10 @@ void ChatHook::Shutdown()
 {
     hooks_.Uninstall("ChatHook::OpenChatInput");
     hooks_.Uninstall("ChatHook::CloseChatInput");
+    hooks_.Uninstall("ChatHook::AddEntry");
+    hooks_.Uninstall("ChatHook::ChatRender");
+    s_orig_add_entry_ = nullptr;
+    s_orig_render_ = nullptr;
     s_orig_open_ = nullptr;
     s_orig_close_ = nullptr;
     s_self_ = nullptr;
@@ -131,7 +163,15 @@ void __fastcall ChatHook::Hook_OpenChatInput(void* pThis, void* _edx)
     if (self->focus_.ShouldBlockChat())
         return;
 
-    if (s_orig_open_)
+    bool cef_chat_active = false;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex_);
+        cef_chat_active = !s_chat_browsers_.empty();
+    }
+
+    // With a CEF chat registered the native input box stays closed: the CEF
+    // page shows its own input when it receives chatInputState(true).
+    if (!cef_chat_active && s_orig_open_)
         s_orig_open_(pThis, _edx);
 
     self->SetChatInputState(true);
@@ -147,4 +187,226 @@ void __fastcall ChatHook::Hook_CloseChatInput(void* pThis, void* _edx)
         s_orig_close_(pThis, _edx);
 
     self->SetChatInputState(false);
+}
+
+// ---------------------------------------------------------------------------
+// CEF chat bridge
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    // Cuts an ANSI string to max_bytes without splitting a double-byte char.
+    std::string ClipAnsi(const std::string& s, size_t max_bytes)
+    {
+        if (s.size() <= max_bytes)
+            return s;
+
+        size_t i = 0;
+        while (i < max_bytes)
+        {
+            const size_t step = ::IsDBCSLeadByte(static_cast<BYTE>(s[i])) ? 2 : 1;
+            if (i + step > max_bytes)
+                break;
+            i += step;
+        }
+        return s.substr(0, i);
+    }
+
+    std::string Utf8ToAnsi(const std::string& utf8)
+    {
+        std::wstring wide;
+        if (!ConvertMultiByteToWide(CP_UTF8, 0, utf8, wide))
+            return utf8;
+
+        std::string out;
+        if (!ConvertWideToMultiByte(::GetACP(), 0, wide, out))
+            return utf8;
+
+        return out;
+    }
+}
+
+void ChatHook::QueueSubmit(const std::string& utf8_text)
+{
+    std::lock_guard<std::mutex> lock(s_mutex_);
+    if (s_pending_input_.size() < 32)
+        s_pending_input_.push_back(utf8_text);
+}
+
+void ChatHook::RegisterChatBrowser(int browser_id)
+{
+    std::lock_guard<std::mutex> lock(s_mutex_);
+    s_chat_browsers_.insert(browser_id);
+    s_replay_requests_.insert(browser_id);   // history is replayed on the game thread
+}
+
+void ChatHook::ForwardEntry(const ChatLine& line, int only_browser)
+{
+    std::vector<int> targets;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex_);
+        if (only_browser >= 0)
+            targets.push_back(only_browser);
+        else
+            targets.assign(s_chat_browsers_.begin(), s_chat_browsers_.end());
+    }
+
+    for (const int id : targets)
+    {
+        auto* inst = browser_.GetBrowserInstance(id);
+        if (!inst || !inst->browser)
+        {
+            std::lock_guard<std::mutex> lock(s_mutex_);
+            s_chat_browsers_.erase(id);   // browser is gone
+            continue;
+        }
+
+        CefRefPtr<CefProcessMessage> msg = CefProcessMessage::Create("emit_event");
+        CefRefPtr<CefListValue> list = msg->GetArgumentList();
+        list->SetString(0, "chat:entry");
+        list->SetInt(1, line.type);
+        list->SetString(2, line.text);
+        list->SetString(3, line.prefix);
+        list->SetInt(4, line.text_color);
+        list->SetInt(5, line.prefix_color);
+        inst->browser->GetMainFrame()->SendProcessMessage(PID_RENDERER, msg);
+    }
+}
+
+void __fastcall ChatHook::Hook_AddEntry(void* pThis, void* _edx, int type, const char* text,
+                                        const char* prefix, unsigned long textColor, unsigned long prefixColor)
+{
+    // Always let the native chat store/log the line first (chatlog, /pagesize...).
+    if (s_orig_add_entry_)
+        s_orig_add_entry_(pThis, _edx, type, text, prefix, textColor, prefixColor);
+
+    auto* self = s_self_;
+    if (!self)
+        return;
+
+    ChatLine line;
+    line.type = type;
+    line.text = EnsureUtf8ForCef(text ? text : "");
+    line.prefix = EnsureUtf8ForCef(prefix ? prefix : "");
+    line.text_color = static_cast<int>(textColor & 0xFFFFFF);
+    line.prefix_color = static_cast<int>(prefixColor & 0xFFFFFF);
+
+    {
+        std::lock_guard<std::mutex> lock(s_mutex_);
+        s_history_.push_back(line);
+        while (s_history_.size() > 100)
+            s_history_.pop_front();
+    }
+
+    self->ForwardEntry(line);
+}
+
+void __fastcall ChatHook::Hook_ChatRender(void* pThis, void* _edx)
+{
+    auto* self = s_self_;
+    bool cef_chat_active = false;
+
+    if (self)
+    {
+        // Game thread: safe place to touch SA-MP structures.
+        std::vector<int> replay;
+        std::deque<ChatLine> history;
+        {
+            std::lock_guard<std::mutex> lock(s_mutex_);
+            cef_chat_active = !s_chat_browsers_.empty();
+            if (!s_replay_requests_.empty())
+            {
+                replay.assign(s_replay_requests_.begin(), s_replay_requests_.end());
+                s_replay_requests_.clear();
+                history = s_history_;
+            }
+        }
+
+        for (const int id : replay)
+            for (const auto& line : history)
+                self->ForwardEntry(line, id);
+
+        self->ProcessPendingInput();
+    }
+
+    // Native chat is not drawn while a CEF chat is showing it.
+    if (!cef_chat_active && s_orig_render_)
+        s_orig_render_(pThis, _edx);
+}
+
+void ChatHook::ProcessPendingInput()
+{
+    std::deque<std::string> batch;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex_);
+        if (s_pending_input_.empty())
+            return;
+        batch.swap(s_pending_input_);
+    }
+
+    for (const auto& utf8 : batch)
+    {
+        // Special marker from the page: "close without sending".
+        if (utf8.empty())
+        {
+            SetChatInputState(false);
+            continue;
+        }
+
+        DispatchInput(ClipAnsi(Utf8ToAnsi(utf8), 128));
+        SetChatInputState(false);
+    }
+}
+
+// Mirrors what SA-MP's own input box does on Enter:
+//   "/name args" -> client command if one is registered, else sent to the server
+//   anything else -> normal chat line
+void ChatHook::DispatchInput(const std::string& text)
+{
+    if (text.empty())
+        return;
+
+    using namespace sampapi::v03dl;
+
+    CInput* input = RefInputBox();
+    if (!input)
+        return;
+
+    if (text[0] == '/')
+    {
+        char name[CInput::MAX_CMD_LENGTH + 1] = {};
+        size_t n = 0;
+        while (1 + n < text.size() && text[1 + n] != ' ' && n < CInput::MAX_CMD_LENGTH)
+        {
+            name[n] = text[1 + n];
+            ++n;
+        }
+
+        const char* args = text.c_str() + 1 + n;
+        if (*args == ' ')
+            ++args;
+
+        int count = input->m_nCommandCount;
+        if (count > CInput::MAX_CLIENT_CMDS)
+            count = CInput::MAX_CLIENT_CMDS;
+        for (int i = 0; i < count; ++i)
+        {
+            if (input->m_pCommandProc[i] && ::lstrcmpiA(input->m_szCommandName[i], name) == 0)
+            {
+                LOG_DEBUG("[ChatHook] client command '{}'", name);
+                input->m_pCommandProc[i](args);
+                return;
+            }
+        }
+
+        LOG_DEBUG("[ChatHook] server command '{}'", name);
+        input->Send(text.c_str());
+        return;
+    }
+
+    auto* netgame = RefNetGame();
+    auto* players = netgame ? netgame->GetPlayerPool() : nullptr;
+    auto* local = players ? players->GetLocalPlayer() : nullptr;
+    if (local)
+        local->Chat(text.c_str());
 }

@@ -2,6 +2,12 @@
 
 #include <Windows.h>
 
+#include <deque>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
+
 class HookManager;
 class FocusManager;
 class BrowserManager;
@@ -21,6 +27,13 @@ public:
     bool Initialize();
     void Shutdown();
 
+    // ---- CEF chat bridge (0.3.DL-R1 only) -------------------------------
+    // Called from the CEF UI side (BrowserClient). Thread-safe; the text is
+    // processed on the game thread inside the chat render hook.
+    static void QueueSubmit(const std::string& utf8_text);
+    // A browser announced it renders the chat: replay history to it.
+    static void RegisterChatBrowser(int browser_id);
+
 private:
     using FnOpenChatInput = void(__fastcall*)(void* pThis, void* _edx);
     static void __fastcall Hook_OpenChatInput(void* pThis, void* _edx);
@@ -29,6 +42,30 @@ private:
     static void __fastcall Hook_CloseChatInput(void* pThis, void* _edx);
 
     void SetChatInputState(bool open);
+
+    // Chat bridge (DL-R1)
+    // CChat::AddEntry(int type, const char* text, const char* prefix, D3DCOLOR textColor, D3DCOLOR prefixColor)
+    using FnAddEntry = void(__fastcall*)(void* pThis, void* _edx, int type, const char* text,
+                                         const char* prefix, unsigned long textColor, unsigned long prefixColor);
+    static void __fastcall Hook_AddEntry(void* pThis, void* _edx, int type, const char* text,
+                                         const char* prefix, unsigned long textColor, unsigned long prefixColor);
+
+    // CChat::Render() : native chat drawing. Skipped while a CEF chat is registered.
+    using FnChatRender = void(__fastcall*)(void* pThis, void* _edx);
+    static void __fastcall Hook_ChatRender(void* pThis, void* _edx);
+
+    struct ChatLine
+    {
+        int type = 0;
+        std::string text;     // UTF-8
+        std::string prefix;   // UTF-8
+        int text_color = 0;   // 0xRRGGBB
+        int prefix_color = 0; // 0xRRGGBB
+    };
+
+    void ForwardEntry(const ChatLine& line, int only_browser = -1);
+    void ProcessPendingInput();
+    void DispatchInput(const std::string& ansi_text);
 
 private:
     HookManager& hooks_;
@@ -39,4 +76,12 @@ private:
     static inline ChatHook* s_self_ = nullptr;
     static inline FnOpenChatInput s_orig_open_ = nullptr;
     static inline FnCloseChatInput s_orig_close_ = nullptr;
+    static inline FnAddEntry s_orig_add_entry_ = nullptr;
+    static inline FnChatRender s_orig_render_ = nullptr;
+
+    static inline std::mutex s_mutex_;
+    static inline std::deque<std::string> s_pending_input_;   // UTF-8, from the CEF side
+    static inline std::deque<ChatLine> s_history_;            // last lines, for replay
+    static inline std::set<int> s_chat_browsers_;
+    static inline std::set<int> s_replay_requests_;
 };
