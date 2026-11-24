@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -63,6 +64,9 @@ private:
     };
 
     void ForwardEntry(const ChatLine& line, int only_browser = -1);
+    // Asks the chat pages to repaint for the next frames (see Tick). OSR pages sometimes keep showing
+    // an old frame until something invalidates them.
+    static void KickRepaint();
     void ProcessPendingInput();
     void DispatchInput(const std::string& ansi_text);
 
@@ -76,6 +80,7 @@ private:
     static inline FnOpenChatInput s_orig_open_ = nullptr;
     static inline FnCloseChatInput s_orig_close_ = nullptr;
     static inline FnAddEntry s_orig_add_entry_ = nullptr;
+    static inline std::atomic<int> s_kick_frames_{ 0 };
     static inline bool s_bridge_enabled_ = false;   // true only on 0.3.DL-R1 with the AddEntry hook installed
 
     static inline std::mutex s_mutex_;

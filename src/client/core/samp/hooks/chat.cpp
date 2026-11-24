@@ -17,6 +17,10 @@
 #include <sampapi/0.3.DL-1/CNetGame.h>
 #include <sampapi/0.3.DL-1/CPlayerPool.h>
 
+#include <include/base/cef_bind.h>
+#include <include/wrapper/cef_closure_task.h>
+#include <include/wrapper/cef_helpers.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -126,6 +130,7 @@ void ChatHook::SetChatInputState(bool open)
         return;
     }
     LOG_INFO("[ChatHook] SetChatInputState({})", open);
+    KickRepaint();
 
     focus_.SetChatInputOpen(open);
 
@@ -235,6 +240,7 @@ void ChatHook::QueueSubmit(const std::string& utf8_text)
         return;
 
     LOG_INFO("[ChatHook] QueueSubmit len={}", utf8_text.size());
+    KickRepaint();
     std::lock_guard<std::mutex> lock(s_mutex_);
     if (s_pending_input_.size() < 32)
         s_pending_input_.push_back(utf8_text);
@@ -249,6 +255,11 @@ void ChatHook::RegisterChatBrowser(int browser_id)
     std::lock_guard<std::mutex> lock(s_mutex_);
     s_chat_browsers_.insert(browser_id);
     s_replay_requests_.insert(browser_id);   // history is replayed on the game thread
+}
+
+void ChatHook::KickRepaint()
+{
+    s_kick_frames_.store(30);   // ~0.5 s of forced repaints, handled in Tick()
 }
 
 void ChatHook::ForwardEntry(const ChatLine& line, int only_browser)
@@ -310,6 +321,7 @@ void __fastcall ChatHook::Hook_AddEntry(void* pThis, void* _edx, int type, const
     }
 
     self->ForwardEntry(line);
+    KickRepaint();
 }
 
 void ChatHook::Tick()
@@ -360,6 +372,37 @@ void ChatHook::Tick()
             self->ForwardEntry(line, id);
 
     self->ProcessPendingInput();
+
+    // Forced repaint of the chat pages while something changed recently.
+    if (s_kick_frames_.load() > 0)
+    {
+        s_kick_frames_.fetch_sub(1);
+
+        std::vector<int> targets;
+        {
+            std::lock_guard<std::mutex> lock(s_mutex_);
+            targets.assign(s_chat_browsers_.begin(), s_chat_browsers_.end());
+        }
+
+        for (const int id : targets)
+        {
+            auto* inst = self->browser_.GetBrowserInstance(id);
+            if (!inst || !inst->browser)
+                continue;
+
+            CefPostTask(TID_UI, base::BindOnce([](CefRefPtr<CefBrowser> browser)
+            {
+                if (!browser)
+                    return;
+                if (auto host = browser->GetHost())
+                {
+                    host->WasHidden(false);
+                    host->WasResized();
+                    host->Invalidate(PET_VIEW);
+                }
+            }, inst->browser));
+        }
+    }
 }
 
 void ChatHook::ProcessPendingInput()
