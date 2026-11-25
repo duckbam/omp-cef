@@ -566,6 +566,7 @@ void BrowserManager::CreateBrowserInternal(
     instance->url = url;
     instance->client = BrowserClient::Create(id, *this, audio_, focus_, network_);
     instance->controls_chat_input = controls_chat;
+    instance->auto_size = (width <= 0.0f || height <= 0.0f);
 
     browsers_[id] = std::move(instance);
 
@@ -609,6 +610,7 @@ void BrowserManager::CreateBrowserInternal(
         browser_width = std::clamp(browser_width, 1, maxTextureWidth);
         browser_height = std::clamp(browser_height, 1, maxTextureHeight);
         inst->view.Create(browser_width, browser_height);
+        LOG_INFO("[CEF] Browser {} view created {}x{} (auto_size={})", id, browser_width, browser_height, inst->auto_size);
     });
 
     if (focused)
@@ -1709,8 +1711,42 @@ void BrowserManager::OnDeviceReset(IDirect3DDevice9* device)
     // Resume CEF updates
     isCefUpdatesPaused_ = false;
 
+    // The game resolution may have changed with this reset.
+    SyncAutoViewSizes();
+
     // The textures were just recreated empty and CEF only repaints dirty regions.
     ForceRepaintAll();
+}
+
+void BrowserManager::SyncAutoViewSizes()
+{
+    float sw = 0.0f, sh = 0.0f;
+    if (!RenderManager::Instance().GetScreenSize(sw, sh))
+        return;
+
+    const int w = (int)sw, h = (int)sh;
+    if (w <= 0 || h <= 0)
+        return;
+
+    for (auto& [id, instance] : browsers_)
+    {
+        if (!instance || !instance->auto_size || instance->mode != RenderMode::Overlay2D || instance->closing)
+            continue;
+
+        const auto r = instance->view.rect();
+        if (r.width == w && r.height == h)
+            continue;
+
+        LOG_INFO("[CEF] Browser {} view resized {}x{} -> {}x{}", id, r.width, r.height, w, h);
+        instance->view.Resize(w, h);
+
+        if (instance->browser)
+            if (auto host = instance->browser->GetHost())
+            {
+                host->WasResized();
+                host->Invalidate(PET_VIEW);
+            }
+    }
 }
 
 void BrowserManager::ForceRepaintAll()

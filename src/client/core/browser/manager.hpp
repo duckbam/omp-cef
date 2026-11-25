@@ -72,6 +72,7 @@ struct BrowserInstance
 
     bool visible = true;
     bool controls_chat_input = true;
+    bool auto_size = false;   // created with width/height 0: follows the game's back buffer size
     bool closing = false;
 
     std::atomic<bool> clear_texture{ false };
@@ -198,6 +199,8 @@ public:
     void OnDeviceLost();
     void OnDeviceReset(IDirect3DDevice9* device);
     void ForceRepaintAll();
+    // Resizes auto-sized overlay browsers when the game's back buffer size changed.
+    void SyncAutoViewSizes();
 
     // True while a CEF text field has keyboard focus (used by ChatHook to decide when the IME is on).
     bool IsFocusedTextInputActive() const;
