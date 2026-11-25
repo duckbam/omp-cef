@@ -58,6 +58,46 @@ static uint32_t GetCefEventFlags()
 
 namespace
 {
+    // --- IME composition (Hangul) -------------------------------------------------------------
+    // Without this the Windows composition box appears in the screen corner and a syllable only
+    // reaches the page once it is finished. imm32 is loaded dynamically (no extra link dependency).
+    #ifndef GCS_COMPSTR
+    #define GCS_COMPSTR 0x0008
+    #endif
+    #ifndef GCS_RESULTSTR
+    #define GCS_RESULTSTR 0x0800
+    #endif
+
+    std::wstring ImeGetString(HWND hwnd, DWORD what)
+    {
+        using GetCtxFn = HANDLE(WINAPI*)(HWND);
+        using GetStrFn = LONG(WINAPI*)(HANDLE, DWORD, LPVOID, DWORD);
+        using RelCtxFn = BOOL(WINAPI*)(HWND, HANDLE);
+
+        static HMODULE imm = ::LoadLibraryW(L"imm32.dll");
+        if (!imm)
+            return {};
+        static auto getCtx = reinterpret_cast<GetCtxFn>(::GetProcAddress(imm, "ImmGetContext"));
+        static auto getStr = reinterpret_cast<GetStrFn>(::GetProcAddress(imm, "ImmGetCompositionStringW"));
+        static auto relCtx = reinterpret_cast<RelCtxFn>(::GetProcAddress(imm, "ImmReleaseContext"));
+        if (!getCtx || !getStr || !relCtx)
+            return {};
+
+        HANDLE himc = getCtx(hwnd);
+        if (!himc)
+            return {};
+
+        std::wstring out;
+        const LONG bytes = getStr(himc, what, nullptr, 0);
+        if (bytes > 0)
+        {
+            out.resize(static_cast<size_t>(bytes) / sizeof(wchar_t));
+            getStr(himc, what, out.data(), static_cast<DWORD>(bytes));
+        }
+        relCtx(hwnd, himc);
+        return out;
+    }
+
     class DevToolsClient final : public CefClient, public CefLifeSpanHandler
     {
     public:
@@ -1765,6 +1805,43 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
     auto host = focused_inst->browser->GetHost();
     if (!host)
         return false;
+
+    // Hangul composition: show the syllable being typed inside the page, hide the Windows box.
+    if (msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_COMPOSITION || msg == WM_IME_ENDCOMPOSITION)
+    {
+        const bool textInput = (focus_ != nullptr) && focus_->IsTextInputFocused(focused_inst->id);
+        if (textInput)
+        {
+            if (msg == WM_IME_COMPOSITION)
+            {
+                if (lParam & GCS_RESULTSTR)
+                {
+                    const std::wstring done = ImeGetString(hwnd, GCS_RESULTSTR);
+                    if (!done.empty())
+                        host->ImeCommitText(CefString(done), CefRange(UINT32_MAX, UINT32_MAX), 0);
+                }
+                if (lParam & GCS_COMPSTR)
+                {
+                    const std::wstring comp = ImeGetString(hwnd, GCS_COMPSTR);
+                    if (!comp.empty())
+                    {
+                        CefCompositionUnderline ul;
+                        ul.range = CefRange(0, static_cast<int>(comp.size()));
+                        ul.color = 0xFF000000;
+                        ul.background_color = 0;
+                        ul.thick = false;
+                        const CefRange end(static_cast<int>(comp.size()), static_cast<int>(comp.size()));
+                        host->ImeSetComposition(CefString(comp), { ul }, CefRange(UINT32_MAX, UINT32_MAX), end);
+                    }
+                    else if (!(lParam & GCS_RESULTSTR))
+                    {
+                        host->ImeCancelComposition();
+                    }
+                }
+            }
+            return true;   // swallow: no native composition box, no WM_IME_CHAR / WM_CHAR duplicates
+        }
+    }
 
     switch (msg)
     {
