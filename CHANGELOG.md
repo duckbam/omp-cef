@@ -1,4 +1,21 @@
 
+## [1.3.9](https://github.com/aurora-mp/omp-cef/compare/v1.3.8..v1.3.9) (2026-11-25)
+
+### 🧹 Chore
+
+- Update CHANGELOG for v1.3.8 - ([a194567](https://github.com/aurora-mp/omp-cef/commit/a1945678aab21c8b0260c021ec962db13c093850))
+- Update CHANGELOG for v1.3.7 - ([a0c46a7](https://github.com/aurora-mp/omp-cef/commit/a0c46a7b7117952e5367f147dcf88918d0548072))
+- Update CHANGELOG for v1.3.6 - ([9953f7f](https://github.com/aurora-mp/omp-cef/commit/9953f7f048edcd24e2e1171674d6b9ae5167022f))
+- Update CHANGELOG for v1.3.6 - ([42bee24](https://github.com/aurora-mp/omp-cef/commit/42bee244e606ce0e65f14c71b0c572f3abb5307a))
+- Update CHANGELOG for v1.3.5 - ([0d6e199](https://github.com/aurora-mp/omp-cef/commit/0d6e199288095fedceb439f81838d9b2a2fce096))
+- Update CHANGELOG for v1.3.4 - ([4b70f36](https://github.com/aurora-mp/omp-cef/commit/4b70f36be91e34f228ad230de833fd9d0afa6bf6))
+- Update CHANGELOG for v1.3.3 - ([7692735](https://github.com/aurora-mp/omp-cef/commit/7692735b68f23dd0239ed76b5f2bba4ec1857f8c))
+- Update CHANGELOG for v1.3.2 - ([09c8d8f](https://github.com/aurora-mp/omp-cef/commit/09c8d8f835cd475e677802051acdeca60cd97f4d))
+- Update CHANGELOG for v1.3.1 - ([3eb5ab2](https://github.com/aurora-mp/omp-cef/commit/3eb5ab26f475c27951d98cb0237ecb3a89d732c6))
+
+
+
+
 ## [1.3.8](https://github.com/aurora-mp/omp-cef/compare/v1.3.7..v1.3.8) (2026-11-25)
 
 ### 🧹 Chore
