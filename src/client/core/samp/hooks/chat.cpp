@@ -280,6 +280,27 @@ namespace
 
         return out;
     }
+
+    // Chat text from the game is always in the Windows ANSI code page (CP949 on Korean systems).
+    // EnsureUtf8ForCef() guesses, and a Hangul syllable whose two bytes happen to look like valid UTF-8
+    // (lead byte C2-C8, trail byte A1-BF) in a line with no other Korean text came out as Latin
+    // garbage such as "I" or "u". Convert as ANSI every time; plain ASCII is identical in both.
+    std::string AnsiToUtf8(const char* text)
+    {
+        if (!text || !*text)
+            return {};
+
+        std::string in(text);
+        std::wstring wide;
+        if (!ConvertMultiByteToWide(::GetACP(), 0, in, wide))
+            return EnsureUtf8ForCef(in);
+
+        std::string out;
+        if (!ConvertWideToMultiByte(CP_UTF8, 0, wide, out))
+            return EnsureUtf8ForCef(in);
+
+        return out;
+    }
 }
 
 void ChatHook::QueueSubmit(const std::string& utf8_text)
@@ -356,8 +377,8 @@ void __fastcall ChatHook::Hook_AddEntry(void* pThis, void* _edx, int type, const
 
     ChatLine line;
     line.type = type;
-    line.text = EnsureUtf8ForCef(text ? text : "");
-    line.prefix = EnsureUtf8ForCef(prefix ? prefix : "");
+    line.text = AnsiToUtf8(text);
+    line.prefix = AnsiToUtf8(prefix);
     line.text_color = static_cast<int>(textColor & 0xFFFFFF);
     line.prefix_color = static_cast<int>(prefixColor & 0xFFFFFF);
 
@@ -424,6 +445,8 @@ void ChatHook::Tick()
             LOG_INFO("[ChatHook] IME {}", want ? "enabled" : "detached");
         }
     }
+
+    self->browser_.SyncAutoViewSizes();
 
     // Forget chat browsers that no longer exist.
     std::vector<int> ids;
