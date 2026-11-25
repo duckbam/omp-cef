@@ -24,6 +24,40 @@
 #include <algorithm>
 #include <cstring>
 
+namespace
+{
+    // IME on/off for the game window. While the chat input is closed the IME is detached, so the
+    // Hangul/English key and IME composition can no longer disturb the game's key handling
+    // (character stops moving, first typed letters lag). It is re-attached when the input opens.
+    // imm32 is loaded dynamically so the client needs no extra link dependency.
+    void SetGameImeEnabled(bool enable)
+    {
+        HWND hwnd = ::GetActiveWindow();
+        if (!hwnd)
+            return;
+
+        static HMODULE imm = ::LoadLibraryW(L"imm32.dll");
+        if (!imm)
+            return;
+
+        using AssocFn = HANDLE(WINAPI*)(HWND, HANDLE);   // HIMC is a handle; avoids needing imm.h
+        using AssocExFn = BOOL(WINAPI*)(HWND, HANDLE, DWORD);
+        static auto assoc = reinterpret_cast<AssocFn>(::GetProcAddress(imm, "ImmAssociateContext"));
+        static auto assocEx = reinterpret_cast<AssocExFn>(::GetProcAddress(imm, "ImmAssociateContextEx"));
+
+        if (enable)
+        {
+            if (assocEx)
+                assocEx(hwnd, nullptr, 0x0010 /* IACE_DEFAULT */);
+        }
+        else if (assoc)
+        {
+            assoc(hwnd, nullptr);
+        }
+    }
+}
+
+
 bool ChatHook::Initialize()
 {
     s_self_ = this;
@@ -379,6 +413,17 @@ void ChatHook::Tick()
     auto* self = s_self_;
     if (!self || !s_bridge_enabled_)
         return;
+
+    {
+        static int s_ime_state = -1;   // -1 = not applied yet
+        const int want = (self->focus_.IsChatInputOpen() || self->browser_.IsFocusedTextInputActive()) ? 1 : 0;
+        if (want != s_ime_state)
+        {
+            s_ime_state = want;
+            SetGameImeEnabled(want == 1);
+            LOG_INFO("[ChatHook] IME {}", want ? "enabled" : "detached");
+        }
+    }
 
     // Forget chat browsers that no longer exist.
     std::vector<int> ids;
