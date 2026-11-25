@@ -199,13 +199,15 @@ public:
     void OnDeviceReset(IDirect3DDevice9* device);
     void ForceRepaintAll();
 
+    // True while a CEF text field has keyboard focus (used by ChatHook to decide when the IME is on).
+    bool IsFocusedTextInputActive() const;
+
 private:
     void CreateBrowserInternal(int id, const std::string& url, bool focused, bool controls_chat, float width, float height);
     void CreateWorldBrowserInternal(int id, const std::string& url, std::string textureName, float width, float height);
     void CreateWorld2DBrowserInternal(int id, const std::string& url, float worldX, float worldY, float worldZ, float width, float height, float offsetZ, float pivotX, float pivotY);
 
     bool ShouldSkipBrowserRendering() const;
-    bool IsFocusedTextInputActive() const;
     void UpdateNativeUiInput();
     void DispatchNativeUiEvents();
     void EmitCustomEscapeMenuVisibility();
