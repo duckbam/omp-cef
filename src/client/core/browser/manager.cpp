@@ -1720,6 +1720,12 @@ void BrowserManager::OnDeviceReset(IDirect3DDevice9* device)
 
 void BrowserManager::SyncAutoViewSizes()
 {
+    // Switched off while the crash after a resolution change is investigated (log: view resized
+    // 1920x1080 -> 800x600, client gone ~9 s later). Set to true to turn the automatic resize back on.
+    static constexpr bool kEnableAutoViewSync = false;
+    if (!kEnableAutoViewSync)
+        return;
+
     float sw = 0.0f, sh = 0.0f;
     if (!RenderManager::Instance().GetScreenSize(sw, sh))
         return;
