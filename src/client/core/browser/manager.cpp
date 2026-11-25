@@ -1,7 +1,6 @@
 #include "manager.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <filesystem>
 
 #include <game_sa/CPlayerPed.h>
@@ -57,110 +56,46 @@ static uint32_t GetCefEventFlags()
     return flags;
 }
 
-static uint32_t GetCefMouseEventFlags(WPARAM wParam)
-{
-    uint32_t flags = GetCefEventFlags();
-    flags &= ~(EVENTFLAG_LEFT_MOUSE_BUTTON | EVENTFLAG_RIGHT_MOUSE_BUTTON | EVENTFLAG_MIDDLE_MOUSE_BUTTON);
-
-    const WORD keyState = GET_KEYSTATE_WPARAM(wParam);
-    if ((keyState & MK_LBUTTON) != 0)
-        flags |= EVENTFLAG_LEFT_MOUSE_BUTTON;
-    if ((keyState & MK_RBUTTON) != 0)
-        flags |= EVENTFLAG_RIGHT_MOUSE_BUTTON;
-    if ((keyState & MK_MBUTTON) != 0)
-        flags |= EVENTFLAG_MIDDLE_MOUSE_BUTTON;
-    return flags;
-}
-
 namespace
 {
-    static bool EnsureDirectory(const std::filesystem::path& path, const char* label)
-    {
-        std::error_code error_code;
-        std::filesystem::create_directories(path, error_code);
+    // --- IME composition (Hangul) -------------------------------------------------------------
+    // Without this the Windows composition box appears in the screen corner and a syllable only
+    // reaches the page once it is finished. imm32 is loaded dynamically (no extra link dependency).
+    #ifndef GCS_COMPSTR
+    #define GCS_COMPSTR 0x0008
+    #endif
+    #ifndef GCS_RESULTSTR
+    #define GCS_RESULTSTR 0x0800
+    #endif
 
-        if (error_code)
+    std::wstring ImeGetString(HWND hwnd, DWORD what)
+    {
+        using GetCtxFn = HANDLE(WINAPI*)(HWND);
+        using GetStrFn = LONG(WINAPI*)(HANDLE, DWORD, LPVOID, DWORD);
+        using RelCtxFn = BOOL(WINAPI*)(HWND, HANDLE);
+
+        static HMODULE imm = ::LoadLibraryW(L"imm32.dll");
+        if (!imm)
+            return {};
+        static auto getCtx = reinterpret_cast<GetCtxFn>(::GetProcAddress(imm, "ImmGetContext"));
+        static auto getStr = reinterpret_cast<GetStrFn>(::GetProcAddress(imm, "ImmGetCompositionStringW"));
+        static auto relCtx = reinterpret_cast<RelCtxFn>(::GetProcAddress(imm, "ImmReleaseContext"));
+        if (!getCtx || !getStr || !relCtx)
+            return {};
+
+        HANDLE himc = getCtx(hwnd);
+        if (!himc)
+            return {};
+
+        std::wstring out;
+        const LONG bytes = getStr(himc, what, nullptr, 0);
+        if (bytes > 0)
         {
-            LOG_FATAL("[CEF] Cannot create {} directory '{}': {}", label, path.string().c_str(), error_code.message().c_str());
-            return false;
+            out.resize(static_cast<size_t>(bytes) / sizeof(wchar_t));
+            getStr(himc, what, out.data(), static_cast<DWORD>(bytes));
         }
-
-        if (!std::filesystem::is_directory(path))
-        {
-            LOG_FATAL("[CEF] {} directory does not exist: {}", label, path.string().c_str());
-            return false;
-        }
-
-        return true;
-    }
-
-    static bool RequireFile(const std::filesystem::path& path, const char* label)
-    {
-        std::error_code error_code;
-        const bool exists = std::filesystem::is_regular_file(path, error_code);
-
-        if (error_code || !exists)
-        {
-            if (error_code)
-                LOG_FATAL("[CEF] Cannot access required {} '{}': {}", label, path.string().c_str(), error_code.message().c_str());
-            else
-                LOG_FATAL("[CEF] Missing required {}: {}", label, path.string().c_str());
-
-            return false;
-        }
-
-        LOG_DEBUG("[CEF] {}: {}", label, path.string().c_str());
-        return true;
-    }
-
-    static bool RequireDirectory(const std::filesystem::path& path, const char* label)
-    {
-        std::error_code error_code;
-        const bool exists = std::filesystem::is_directory(path, error_code);
-
-        if (error_code || !exists)
-        {
-            if (error_code)
-                LOG_FATAL("[CEF] Cannot access required {} directory '{}': {}", label, path.string().c_str(), error_code.message().c_str());
-            else
-                LOG_FATAL("[CEF] Missing required {} directory: {}", label, path.string().c_str());
-
-            return false;
-        }
-
-        LOG_DEBUG("[CEF] {} directory: {}", label, path.string().c_str());
-        return true;
-    }
-
-    static void LogOptionalFile(const std::filesystem::path& path, const char* label)
-    {
-        std::error_code error_code;
-        const bool exists = std::filesystem::is_regular_file(path, error_code);
-
-        if (exists)
-            LOG_DEBUG("[CEF] {}: {}", label, path.string().c_str());
-        else if (error_code)
-            LOG_WARN("[CEF] Cannot access optional {} '{}': {}", label, path.string().c_str(), error_code.message().c_str());
-        else
-            LOG_WARN("[CEF] Optional {} not found: {}", label, path.string().c_str());
-    }
-
-    static bool ValidateCefRuntime(const std::filesystem::path& cef_dir)
-    {
-        bool valid = true;
-
-        valid &= RequireDirectory(cef_dir, "runtime");
-        valid &= RequireFile(cef_dir / "renderer.exe", "renderer subprocess");
-        valid &= RequireFile(cef_dir / "libcef.dll", "libcef.dll");
-        valid &= RequireFile(cef_dir / "icudtl.dat", "ICU data file");
-        valid &= RequireFile(cef_dir / "resources.pak", "resources.pak");
-        valid &= RequireDirectory(cef_dir / "locales", "locales");
-
-        LogOptionalFile(cef_dir / "chrome_100_percent.pak", "chrome_100_percent.pak");
-        LogOptionalFile(cef_dir / "chrome_200_percent.pak", "chrome_200_percent.pak");
-        LogOptionalFile(cef_dir / "v8_context_snapshot.bin", "v8_context_snapshot.bin");
-
-        return valid;
+        relCtx(hwnd, himc);
+        return out;
     }
 
     class DevToolsClient final : public CefClient, public CefLifeSpanHandler
@@ -237,17 +172,14 @@ bool BrowserManager::Initialize()
     wchar_t exe_path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
 
-    const auto base = std::filesystem::path(exe_path).parent_path();
-    const auto cef_dir = base / "cef";
-    const auto cef_subprocess = cef_dir / "renderer.exe";
-    const auto cef_resources_dir = cef_dir;
-    const auto cef_locales_dir = cef_dir / "locales";
+    auto base = std::filesystem::path(exe_path).parent_path();
+    auto cef_dir = base / "cef";
 
     // Use GTA user files (writable) for ALL CEF internal data.
     // Keep game folder 'cef/' for binaries/resources, not for cache/profile.
-    const auto user_files = std::filesystem::path(gta_.GetUserFilesPath());
-    const auto user_cef_root = user_files / "cef";
-    const auto user_cef_ui_cache = user_cef_root / "cache";
+    auto user_files = std::filesystem::path(gta_.GetUserFilesPath());
+    auto user_cef_root = user_files / "cef";
+    auto user_cef_ui_cache = user_cef_root / "cache";
 
     // CEF internal cache/profile
     const auto user_cache_dir = user_cef_root / "cef_cache";
@@ -255,35 +187,26 @@ bool BrowserManager::Initialize()
     // CEF debug log
     const auto cef_log_file = user_cef_root / "debug.log";
 
-    LOG_DEBUG("[CEF] Game executable: {}", std::filesystem::path(exe_path).string().c_str());
-    LOG_DEBUG("[CEF] Game directory: {}", base.string().c_str());
-    LOG_DEBUG("[CEF] Runtime directory: {}", cef_dir.string().c_str());
-    LOG_DEBUG("[CEF] Resources directory: {}", cef_resources_dir.string().c_str());
-    LOG_DEBUG("[CEF] Locales directory: {}", cef_locales_dir.string().c_str());
-    LOG_DEBUG("[CEF] Renderer subprocess: {}", cef_subprocess.string().c_str());
+    std::error_code error_code;
+    std::filesystem::create_directories(user_cef_ui_cache, error_code);
+    std::filesystem::create_directories(user_cache_dir, error_code);
+
     LOG_DEBUG("[CEF] UserFiles: {}", user_files.string().c_str());
     LOG_DEBUG("[CEF] UI cache: {}", user_cef_ui_cache.string().c_str());
     LOG_DEBUG("[CEF] CEF cache: {}", user_cache_dir.string().c_str());
     LOG_DEBUG("[CEF] CEF log: {}", cef_log_file.string().c_str());
 
-    if (!ValidateCefRuntime(cef_dir))
+    // If we still can't create dirs, fail init cleanly
+    if (!std::filesystem::exists(user_cache_dir))
     {
-        LOG_FATAL("[CEF] Runtime validation failed. Reinstall the full omp-cef client package. Do not mix CEF files from different versions.");
+        LOG_FATAL("[CEF] Cannot create CEF cache dir: {}", user_cache_dir.string().c_str());
         return false;
     }
-
-    if (!EnsureDirectory(user_cef_ui_cache, "UI cache"))
-        return false;
-
-    if (!EnsureDirectory(user_cache_dir, "CEF cache"))
-        return false;
 
     CefString(&settings.log_file) = cef_log_file.wstring();
     CefString(&settings.root_cache_path) = user_cache_dir.wstring();
     CefString(&settings.cache_path) = user_cache_dir.wstring();
-    CefString(&settings.browser_subprocess_path) = cef_subprocess.wstring();
-    CefString(&settings.resources_dir_path) = cef_resources_dir.wstring();
-    CefString(&settings.locales_dir_path) = cef_locales_dir.wstring();
+    CefString(&settings.browser_subprocess_path) = (cef_dir / "renderer.exe").wstring();
 
     settings.no_sandbox = true;
     settings.log_severity = LOGSEVERITY_INFO;
@@ -300,13 +223,7 @@ bool BrowserManager::Initialize()
 
     if (!CefInitialize(main_args, settings, app.get(), nullptr))
     {
-        LOG_FATAL("[CEF] CefInitialize returned false.");
-        LOG_FATAL("[CEF] Runtime directory: {}", cef_dir.string().c_str());
-        LOG_FATAL("[CEF] Resources directory: {}", cef_resources_dir.string().c_str());
-        LOG_FATAL("[CEF] Locales directory: {}", cef_locales_dir.string().c_str());
-        LOG_FATAL("[CEF] Renderer subprocess: {}", cef_subprocess.string().c_str());
-        LOG_FATAL("[CEF] Cache directory: {}", user_cache_dir.string().c_str());
-        LOG_FATAL("[CEF] Delete the CEF cache and reinstall the full matching client package if this persists.");
+        LOG_FATAL("[CEF] Initialization failed !");
         return false;
     }
 
@@ -558,19 +475,9 @@ void BrowserManager::Shutdown()
 
     LOG_DEBUG("Shutting down CEF Browser manager...");
 
-    screen_capture_.StopAll();
-    screen_capture_.OnDeviceLost();
-
-    {
-        BrowsersLock lock(browsers_mutex_);
-        pending_.clear();
-        player_stats_poll_.clear();
-        entityToBrowserId_.clear();
-        worldRenderers_.clear();
-        browsers_.clear();
-        retired_world_renderers_.clear();
-        retired_browsers_.clear();
-    }
+    browsers_.clear();
+    worldRenderers_.clear();
+    entityToBrowserId_.clear();
 
     CefShutdown();
     initialized_ = false;
@@ -582,16 +489,12 @@ void BrowserManager::CreateBrowser(
     int id, const std::string& url, bool focused, bool controls_chat, float width, float height)
 {
     LOG_DEBUG("[CEF] CreateBrowser called with ID={}, url={}", id, url);
-
+    
+    if (browsers_.count(id))
     {
-        BrowsersLock lock(browsers_mutex_);
-        if (const auto it = browsers_.find(id); it != browsers_.end())
-        {
-            LOG_ERROR("[CEF] CreateBrowser failed: Browser with ID {} already exists.", id);
-            LOG_ERROR("[CEF] Existing browser mode: {}", (int)it->second->mode);
-            ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_IdAlreadyInUse, "ID already in use");
-            return;
-        }
+        LOG_ERROR("[CEF] CreateBrowser failed: Browser with ID {} already exists.", id);
+        LOG_ERROR("[CEF] Existing browser mode: {}", (int)browsers_[id]->mode);
+        return;
     }
     CreateBrowserInternal(id, url, focused, controls_chat, width, height);
 }
@@ -605,15 +508,11 @@ void BrowserManager::CreateWorldBrowser(
     if (normalized_url != url)
         LOG_DEBUG("[CEF] Normalized URL -> {}", normalized_url);
 
+    if (browsers_.count(id))
     {
-        BrowsersLock lock(browsers_mutex_);
-        if (const auto it = browsers_.find(id); it != browsers_.end())
-        {
-            LOG_ERROR("[CEF] CreateWorldBrowser failed: Browser with ID {} already exists.", id);
-            LOG_ERROR("[CEF] Existing browser mode: {}", (int)it->second->mode);
-            ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_IdAlreadyInUse, "ID already in use");
-            return;
-        }
+        LOG_ERROR("[CEF] CreateWorldBrowser failed: Browser with ID {} already exists.", id);
+        LOG_ERROR("[CEF] Existing browser mode: {}", (int)browsers_[id]->mode);
+        return;
     }
 
     CreateWorldBrowserInternal(id, normalized_url, textureName, width, height);
@@ -629,15 +528,11 @@ void BrowserManager::CreateWorld2DBrowser(
     if (normalized_url != url)
         LOG_DEBUG("[CEF] Normalized URL -> {}", normalized_url);
 
+    if (browsers_.count(id))
     {
-        BrowsersLock lock(browsers_mutex_);
-        if (const auto it = browsers_.find(id); it != browsers_.end())
-        {
-            LOG_ERROR("[CEF] CreateWorld2DBrowser failed: Browser with ID {} already exists.", id);
-            LOG_ERROR("[CEF] Existing browser mode: {}", (int)it->second->mode);
-            ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_IdAlreadyInUse, "ID already in use");
-            return;
-        }
+        LOG_ERROR("[CEF] CreateWorld2DBrowser failed: Browser with ID {} already exists.", id);
+        LOG_ERROR("[CEF] Existing browser mode: {}", (int)browsers_[id]->mode);
+        return;
     }
 
     CreateWorld2DBrowserInternal(id, normalized_url, worldX, worldY, worldZ, width, height, offsetZ, pivotX, pivotY);
@@ -660,12 +555,9 @@ void BrowserManager::CreateBrowserInternal(
         return;
     }
 
-    BrowsersLock lock(browsers_mutex_);
-
     if (browsers_.count(id))
     {
         LOG_ERROR("[CEF] CreateBrowserInternal: Browser with ID {} already exists (race condition?).", id);
-        ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_IdAlreadyInUse, "ID already in use");
         return;
     }
 
@@ -678,8 +570,6 @@ void BrowserManager::CreateBrowserInternal(
     browsers_[id] = std::move(instance);
 
     gta_.PostToMainThread([this, id, width, height]() {
-        BrowsersLock lock(browsers_mutex_);
-
         auto* inst = GetBrowserInstance(id);
         if (!inst) return;
 
@@ -724,7 +614,13 @@ void BrowserManager::CreateBrowserInternal(
     if (focused)
         FocusBrowser(id, true);
 
-    LaunchBrowserLocked(id, url);
+    CefWindowInfo windowInfo;
+    windowInfo.SetAsWindowless(gta_.GetHwnd());
+    windowInfo.external_begin_frame_enabled = true;
+    CefBrowserSettings bs;
+    ConfigureBrowserSettings(bs);
+    CefBrowserHost::CreateBrowser(
+        windowInfo, browsers_[id]->client, url, bs, nullptr, CefRequestContext::GetGlobalContext());
 }
 
 void BrowserManager::CreateWorldBrowserInternal(
@@ -743,12 +639,9 @@ void BrowserManager::CreateWorldBrowserInternal(
         return;
     }
 
-    BrowsersLock lock(browsers_mutex_);
-
     if (browsers_.count(id))
     {
         LOG_ERROR("[CEF] CreateWorldBrowserInternal: Browser with ID {} already exists (race condition?).", id);
-        ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_IdAlreadyInUse, "ID already in use");
         return;
     }
 
@@ -763,8 +656,6 @@ void BrowserManager::CreateWorldBrowserInternal(
     const int browser_height = std::clamp((int)height, 1, 1024);
 
     gta_.PostToMainThread([this, id, textureName, browser_width, browser_height]() {
-        BrowsersLock lock(browsers_mutex_);
-
         auto* inst = GetBrowserInstance(id);
         if (!inst) return;
 
@@ -780,7 +671,12 @@ void BrowserManager::CreateWorldBrowserInternal(
     audio_.EnsureStream(id);
     audio_.SetStreamMuted(id, true);
 
-    LaunchBrowserLocked(id, url);
+    CefWindowInfo windowInfo;
+    windowInfo.SetAsWindowless(gta_.GetHwnd());
+    windowInfo.external_begin_frame_enabled = true;
+    CefBrowserSettings bs;
+    ConfigureBrowserSettings(bs);
+    CefBrowserHost::CreateBrowser(windowInfo, browsers_[id]->client, url, bs, nullptr, CefRequestContext::GetGlobalContext());
 }
 
 void BrowserManager::CreateWorld2DBrowserInternal(
@@ -804,12 +700,9 @@ void BrowserManager::CreateWorld2DBrowserInternal(
         return;
     }
 
-    BrowsersLock lock(browsers_mutex_);
-
     if (browsers_.count(id))
     {
         LOG_ERROR("[CEF] CreateWorld2DBrowserInternal: Browser with ID {} already exists (race condition?).", id);
-        ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_IdAlreadyInUse, "ID already in use");
         return;
     }
 
@@ -828,8 +721,6 @@ void BrowserManager::CreateWorld2DBrowserInternal(
     browsers_[id] = std::move(instance);
 
     gta_.PostToMainThread([this, id, width, height]() {
-        BrowsersLock lock(browsers_mutex_);
-
         auto* inst = GetBrowserInstance(id);
         if (!inst) return;
 
@@ -838,44 +729,17 @@ void BrowserManager::CreateWorld2DBrowserInternal(
 
         inst->view.Initialize(device);
 
-        int bw =std::clamp((int)width, 1, 1024);
+        int bw = std::clamp((int)width, 1, 1024);
         int bh = std::clamp((int)height, 1, 1024);
         inst->view.Create(bw, bh);
     });
-
-    LaunchBrowserLocked(id, url);
-}
-
-void BrowserManager::ReportBrowserCreateFailure(int id, BrowserCreateStatus status, const std::string& reason)
-{
-    // Without this the server never receives OnCefBrowserCreated for this call.
-    network_.SendBrowserCreateResult(id, false, static_cast<int>(status), reason);
-}
-
-void BrowserManager::LaunchBrowserLocked(int id, const std::string& url)
-{
-    // Caller holds browsers_mutex_ and has just inserted browsers_[id].
-    const auto it = browsers_.find(id);
-    if (it == browsers_.end() || !it->second)
-        return;
 
     CefWindowInfo windowInfo;
     windowInfo.SetAsWindowless(gta_.GetHwnd());
     windowInfo.external_begin_frame_enabled = true;
     CefBrowserSettings bs;
     ConfigureBrowserSettings(bs);
-
-    if (CefBrowserHost::CreateBrowser(windowInfo, it->second->client, url, bs, nullptr, CefRequestContext::GetGlobalContext()))
-        return;
-
-    LOG_ERROR("[CEF] CefBrowserHost::CreateBrowser failed for browser ID {}.", id);
-
-    if (focusedBrowserId_ == id)
-        focusedBrowserId_ = -1;
-
-    pending_.erase(id);
-    RetireBrowserLocked(id);
-    ReportBrowserCreateFailure(id, BrowserCreateStatus::Error_Generic, "Browser creation failed");
+    CefBrowserHost::CreateBrowser(windowInfo, browsers_[id]->client, url, bs, nullptr, CefRequestContext::GetGlobalContext());
 }
 
 void BrowserManager::SetWorld2DBrowserPos(int id, float worldX, float worldY, float worldZ)
@@ -902,30 +766,6 @@ void BrowserManager::SetWorld2DBrowserPos(int id, float worldX, float worldY, fl
     instance->world2d.x = worldX;
     instance->world2d.y = worldY;
     instance->world2d.z = worldZ;
-}
-
-void BrowserManager::SetBrowserLayer(int id, int layer)
-{
-    if (!CefCurrentlyOn(TID_UI))
-    {
-        CefPostTask(TID_UI, base::BindOnce(&BrowserManager::SetBrowserLayer, base::Unretained(this), id, layer));
-        return;
-    }
-
-    auto* instance = GetBrowserInstance(id);
-    if (!instance || instance->closing)
-    {
-        LOG_WARN("[CEF] SetBrowserLayer: Could not find active browser with ID {}.", id);
-        return;
-    }
-
-    if (instance->mode == RenderMode::WorldObject3D)
-    {
-        LOG_WARN("[CEF] SetBrowserLayer: Browser {} is a WorldObject3D browser.", id);
-        return;
-    }
-
-    instance->layer.store(layer, std::memory_order_relaxed);
 }
 
 void BrowserManager::SetBrowserVisible(int id, bool visible)
@@ -961,7 +801,6 @@ void BrowserManager::SetBrowserVisible(int id, bool visible)
 
     if (!visible)
     {
-        CancelDrag(id);
         ClearPendingPaint(id);
 
         if (focusedBrowserId_ == id)
@@ -977,11 +816,8 @@ void BrowserManager::DestroyBrowser(int id)
         return;
     }
 
-    BrowsersLock lock(browsers_mutex_);
-
     player_stats_poll_.erase(id);
     pending_.erase(id);
-    CancelDrag(id);
 
     auto it = browsers_.find(id);
     if (it == browsers_.end())
@@ -1017,6 +853,8 @@ void BrowserManager::DestroyBrowser(int id)
         }
     }
 
+    worldRenderers_.erase(id);
+
     if (instance->browser && instance->browser->GetHost())
     {
         instance->view.SetFocused(false);
@@ -1024,43 +862,8 @@ void BrowserManager::DestroyBrowser(int id)
         instance->browser = nullptr;
     }
 
-    RetireBrowserLocked(id);
+    browsers_.erase(it);
     LOG_DEBUG("[CEF] Browser ID {} destroyed and removed from map.", id);
-}
-
-void BrowserManager::RetireBrowserLocked(int id)
-{
-    if (auto wr = worldRenderers_.find(id); wr != worldRenderers_.end())
-    {
-        if (wr->second)
-            retired_world_renderers_.push_back(std::move(wr->second));
-        worldRenderers_.erase(wr);
-    }
-
-    if (auto it = browsers_.find(id); it != browsers_.end())
-    {
-        if (it->second)
-            retired_browsers_.push_back(std::move(it->second));
-        browsers_.erase(it);
-    }
-}
-
-void BrowserManager::ReleaseRetiredResources()
-{
-    // Game thread only.
-    std::vector<std::unique_ptr<WorldRenderer>> world_renderers;
-    std::vector<std::unique_ptr<BrowserInstance>> browsers;
-    {
-        BrowsersLock lock(browsers_mutex_);
-        if (retired_world_renderers_.empty() && retired_browsers_.empty())
-            return;
-
-        world_renderers.swap(retired_world_renderers_);
-        browsers.swap(retired_browsers_);
-    }
-
-    world_renderers.clear();
-    browsers.clear();
 }
 
 void BrowserManager::DestroyAllBrowsers()
@@ -1071,33 +874,13 @@ void BrowserManager::DestroyAllBrowsers()
         return;
     }
 
-    for (int id : GetBrowserIds())
-        DestroyBrowser(id);
-}
-
-std::vector<int> BrowserManager::GetBrowserIds() const
-{
-    BrowsersLock lock(browsers_mutex_);
-
     std::vector<int> ids;
     ids.reserve(browsers_.size());
-    for (const auto& kv : browsers_)
+    for (auto& kv : browsers_)
         ids.push_back(kv.first);
 
-    return ids;
-}
-
-CefRect BrowserManager::GetBrowserViewRect(int id)
-{
-    BrowsersLock lock(browsers_mutex_);
-
-    if (auto* instance = GetBrowserInstance(id))
-    {
-        const auto rect = instance->view.rect();
-        return CefRect(rect.x, rect.y, rect.width, rect.height);
-    }
-
-    return CefRect(0, 0, 1, 1);
+    for (int id : ids)
+        DestroyBrowser(id);
 }
 
 void BrowserManager::ReloadBrowser(int id, bool ignoreCache)
@@ -1198,8 +981,6 @@ void BrowserManager::SetDevToolsEnabled(int browserId, bool enabled)
 
 void BrowserManager::AttachBrowserToObject(int browserId, int objectId)
 {
-    BrowsersLock lock(browsers_mutex_);
-
     if (!browsers_.count(browserId))
     {
         LOG_WARN("[CEF] AttachBrowserToObject: Browser ID {} does not exist.", browserId);
@@ -1221,8 +1002,6 @@ void BrowserManager::AttachBrowserToObject(int browserId, int objectId)
 
 void BrowserManager::DetachBrowserFromObject(int browserId, int objectId)
 {
-    BrowsersLock lock(browsers_mutex_);
-
     CEntity* nativeEntity = GetEntityFromObjectId(objectId);
     if (nativeEntity)
     {
@@ -1255,8 +1034,6 @@ CEntity* BrowserManager::GetEntityFromObjectId(int objectId)
 
 void BrowserManager::OnBrowserCreated(int id, CefRefPtr<CefBrowser> browser)
 {
-    BrowsersLock lock(browsers_mutex_);
-
     auto it = browsers_.find(id);
     if (it != browsers_.end())
     {
@@ -1278,111 +1055,13 @@ void BrowserManager::OnBrowserCreated(int id, CefRefPtr<CefBrowser> browser)
 
 void BrowserManager::OnBrowserClosed(int id)
 {
-    screen_capture_.Stop(id);
-
-    BrowsersLock lock(browsers_mutex_);
     player_stats_poll_.erase(id);
     pending_.erase(id);
-    RetireBrowserLocked(id);
-}
-
-void BrowserManager::StartScreenCapture(int browserId, int width, int height, int fps)
-{
-    if (!GetBrowserInstance(browserId))
-        return;
-
-    const auto config = screen_capture_.Start(browserId, width, height, fps);
-    LOG_INFO("[ScreenCapture] Started for browser {} ({}x{} @ {} FPS)",
-        browserId, config.width, config.height, config.fps);
-}
-
-void BrowserManager::StopScreenCapture(int browserId)
-{
-    screen_capture_.Stop(browserId);
-    LOG_INFO("[ScreenCapture] Stopped for browser {}", browserId);
-}
-
-void BrowserManager::CaptureScreen()
-{
-    if (isCefUpdatesPaused_ || is_shutting_down_ || !screen_capture_.HasSubscriptions())
-        return;
-
-    auto* device = RenderManager::Instance().GetDevice();
-    if (!device)
-        return;
-
-    auto frames = screen_capture_.CaptureDueFrames(device, ::GetTickCount64());
-    for (auto& frame : frames)
-    {
-        const int browser_id = frame->browser_id;
-        const uint64_t generation = frame->generation;
-        if (!CefPostTask(TID_UI, base::BindOnce(
-                &BrowserManager::DispatchScreenFrameOnUi,
-                base::Unretained(this),
-                std::move(frame))))
-        {
-            screen_capture_.CompleteFrame(browser_id, generation);
-        }
-    }
-}
-
-void BrowserManager::DispatchScreenFrameOnUi(std::shared_ptr<CapturedScreenFrame> frame)
-{
-    CEF_REQUIRE_UI_THREAD();
-
-    if (!frame)
-        return;
-
-    const auto complete = [this, &frame]() {
-        screen_capture_.CompleteFrame(frame->browser_id, frame->generation);
-    };
-
-    if (is_shutting_down_ ||
-        !screen_capture_.IsCurrent(frame->browser_id, frame->generation) ||
-        !frame->rgba || frame->rgba->empty())
-    {
-        complete();
-        return;
-    }
-
-    auto* instance = GetBrowserInstance(frame->browser_id);
-    if (!instance || !instance->browser || !instance->browser->IsValid())
-    {
-        complete();
-        return;
-    }
-
-    CefRefPtr<CefFrame> main_frame = instance->browser->GetMainFrame();
-    if (!main_frame || !main_frame->IsValid())
-    {
-        complete();
-        return;
-    }
-
-    CefRefPtr<CefBinaryValue> pixels = CefBinaryValue::Create(
-        frame->rgba->data(), frame->rgba->size());
-    if (!pixels)
-    {
-        complete();
-        return;
-    }
-
-    CefRefPtr<CefProcessMessage> message = CefProcessMessage::Create("cef_screen_capture_frame");
-    CefRefPtr<CefListValue> args = message->GetArgumentList();
-    args->SetBinary(0, pixels);
-    args->SetInt(1, frame->width);
-    args->SetInt(2, frame->height);
-    args->SetInt(3, static_cast<int>(frame->sequence));
-    args->SetDouble(4, frame->timestamp_ms);
-    main_frame->SendProcessMessage(PID_RENDERER, message);
-
-    complete();
+    browsers_.erase(id);
 }
 
 void BrowserManager::ClearPendingPaint(int id)
 {
-    BrowsersLock browsers_lock(browsers_mutex_);
-
     auto it = pending_.find(id);
     if (it == pending_.end())
         return;
@@ -1397,73 +1076,6 @@ void BrowserManager::ClearPendingPaint(int id)
     pending_paint.tick = 0;
 }
 
-void BrowserManager::RestoreBrowserTextures()
-{
-    BrowsersLock browsers_lock(browsers_mutex_);
-
-    for (auto& [id, instance] : browsers_)
-    {
-        if (!instance || !instance->visible)
-            continue;
-
-        auto it = pending_.find(id);
-        if (it == pending_.end())
-            continue;
-
-        auto& pending_paint = it->second;
-        std::lock_guard<std::mutex> lock(pending_paint.mutex);
-
-        if (pending_paint.pixels.empty() || pending_paint.width <= 0 || pending_paint.height <= 0)
-            continue;
-
-        if (instance->mode == RenderMode::WorldObject3D)
-        {
-            auto world_renderer = worldRenderers_.find(id);
-            if (world_renderer != worldRenderers_.end() && world_renderer->second)
-            {
-                world_renderer->second->OnPaint(
-                    pending_paint.pixels.data(),
-                    pending_paint.width,
-                    pending_paint.height
-                );
-            }
-        }
-        else
-        {
-            instance->view.OnPaint(pending_paint.pixels.data(), pending_paint.width, pending_paint.height);
-        }
-
-        pending_paint.ready = false;
-        pending_paint.dirty_rects.clear();
-    }
-}
-
-void BrowserManager::RequestVisibleBrowsersRepaint()
-{
-    if (!CefCurrentlyOn(TID_UI))
-    {
-        CefPostTask(TID_UI, base::BindOnce(&BrowserManager::RequestVisibleBrowsersRepaint, base::Unretained(this)));
-        return;
-    }
-
-    BrowsersLock browsers_lock(browsers_mutex_);
-
-    for (auto& [id, instance] : browsers_)
-    {
-        if (!instance || !instance->visible || !instance->browser || !instance->browser->IsValid())
-            continue;
-
-        auto host = instance->browser->GetHost();
-        if (!host)
-            continue;
-
-        host->WasHidden(false);
-        host->WasResized();
-        host->Invalidate(PET_VIEW);
-        host->SendExternalBeginFrame();
-    }
-}
-
 void BrowserManager::RequestTextureClear(int id)
 {
     if (auto* instance = GetBrowserInstance(id))
@@ -1474,8 +1086,6 @@ void BrowserManager::OnPaint(int id, const void* buffer, int width, int height, 
 {
     if (isCefUpdatesPaused_ || !buffer || width <= 0 || height <= 0)
         return;
-
-    BrowsersLock browsers_lock(browsers_mutex_);
 
     auto* instance = GetBrowserInstance(id);
     if (!instance)
@@ -1564,17 +1174,13 @@ void BrowserManager::DispatchExternalBeginFramesOnUi()
 {
     CEF_REQUIRE_UI_THREAD();
 
+    for (auto& [id, inst] : browsers_)
     {
-        BrowsersLock browsers_lock(browsers_mutex_);
+        if (!inst || !inst->visible || !inst->browser || !inst->browser->IsValid())
+            continue;
 
-        for (auto& [id, inst] : browsers_)
-        {
-            if (!inst || !inst->visible || !inst->browser || !inst->browser->IsValid())
-                continue;
-
-            if (auto host = inst->browser->GetHost())
-                host->SendExternalBeginFrame();
-        }
+        if (auto host = inst->browser->GetHost())
+            host->SendExternalBeginFrame();
     }
 
     begin_frame_task_pending_.store(false, std::memory_order_release);
@@ -1582,13 +1188,10 @@ void BrowserManager::DispatchExternalBeginFramesOnUi()
 
 bool BrowserManager::RenderAll()
 {
-    ReleaseRetiredResources();
     UpdateNativeUiInput();
 
     if (ShouldSkipBrowserRendering())
         return false;
-
-    BrowsersLock browsers_lock(browsers_mutex_);
 
     UpdateAudioSpatialization();
     SendExternalBeginFrames();
@@ -1661,46 +1264,15 @@ bool BrowserManager::RenderAll()
         pending_paint.dirty_rects.clear();
     }
 
-    struct RenderEntry
-    {
-        BrowserInstance* browser;
-        int layer;
-    };
-    std::vector<RenderEntry> render_order;
-    render_order.reserve(browsers_.size());
+    bool any_visible = false;
+
     for (auto& [id, browser] : browsers_)
     {
-        if (browser && browser->visible && !browser->closing && browser->mode != RenderMode::WorldObject3D)
-            render_order.push_back({browser.get(), browser->layer.load(std::memory_order_relaxed)});
-    }
+        if (!browser)
+            continue;
 
-    if (render_order.empty())
-        return false;
-
-    // Snapshot layers before sorting so concurrent updates cannot change the comparator.
-    // Equal layers use browser IDs, making draw order independent of unordered_map layout.
-    std::sort(render_order.begin(), render_order.end(), [](const RenderEntry& a, const RenderEntry& b) {
-        return a.layer != b.layer ? a.layer < b.layer : a.browser->id < b.browser->id;
-    });
-
-    // This pass runs just before Present, after the game's scene has ended.
-    auto* device = RenderManager::Instance().GetDevice();
-    if (!device || FAILED(device->BeginScene()))
-        return false;
-
-    // Save the game's state once for all browser draws, including stream 0
-    // which DrawPrimitiveUP clears.
-    IDirect3DStateBlock9* game_state = nullptr;
-    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &game_state)))
-    {
-        device->EndScene();
-        return false;
-    }
-
-    bool any_visible = false;
-    for (const auto& entry : render_order)
-    {
-        auto* browser = entry.browser;
+        if (!browser->visible)
+            continue;
 
         // Overlay2D
         if (browser->mode == RenderMode::Overlay2D)
@@ -1741,21 +1313,12 @@ bool BrowserManager::RenderAll()
         }
     }
 
-    game_state->Apply();
-    game_state->Release();
-    device->EndScene();
-
     return any_visible;
 }
 
 void BrowserManager::OnBeforeEntityRender(CEntity* entity)
 {
     if (ShouldSkipBrowserRendering())
-        return;
-
-    BrowsersLock browsers_lock(browsers_mutex_);
-
-    if (entityToBrowserId_.empty())
         return;
 
     auto it = entityToBrowserId_.find(entity);
@@ -1777,17 +1340,12 @@ void BrowserManager::OnBeforeEntityRender(CEntity* entity)
 
 void BrowserManager::OnAfterEntityRender(CEntity* entity)
 {
-    BrowsersLock browsers_lock(browsers_mutex_);
-
-    if (entityToBrowserId_.empty())
-        return;
-
     auto it = entityToBrowserId_.find(entity);
     if (it == entityToBrowserId_.end())
         return;
     int browserId = it->second;
     auto wrIt = worldRenderers_.find(browserId);
-    if (wrIt != worldRenderers_.end() && wrIt->second)
+    if (wrIt != worldRenderers_.end())
     {
         wrIt->second->RestoreTexture();
     }
@@ -1795,8 +1353,6 @@ void BrowserManager::OnAfterEntityRender(CEntity* entity)
 
 BrowserInstance* BrowserManager::GetBrowserInstance(int id)
 {
-    BrowsersLock browsers_lock(browsers_mutex_);
-
     auto it = browsers_.find(id);
     return it != browsers_.end() ? it->second.get() : nullptr;
 }
@@ -1805,8 +1361,6 @@ bool BrowserManager::IsAnyBrowserVisible() const
 {
     if (ShouldSkipBrowserRendering())
         return false;
-
-    BrowsersLock browsers_lock(browsers_mutex_);
 
     for (const auto& [id, browser] : browsers_)
     {
@@ -1818,8 +1372,6 @@ bool BrowserManager::IsAnyBrowserVisible() const
 
 bool BrowserManager::IsAnyBrowserFocused() const
 {
-    BrowsersLock browsers_lock(browsers_mutex_);
-
     for (const auto& [id, instance] : browsers_)
     {
         if (instance && instance->view.IsFocused())
@@ -1870,7 +1422,6 @@ void BrowserManager::FocusBrowser(int browserId, bool focus)
         if (focusedBrowserId_ != browserId)
             return;
 
-        CancelDrag(browserId);
         focusedBrowserId_ = -1;
         instance_to_change->view.SetFocused(false);
 
@@ -1907,7 +1458,6 @@ void BrowserManager::UpdateAudioSpatialization()
     }
 
     // Update 3D positions for world browsers bound to entities
-    BrowsersLock browsers_lock(browsers_mutex_);
     for (const auto& [entity, browserId] : entityToBrowserId_)
     {
         if (entity && entity->m_matrix)
@@ -1935,12 +1485,6 @@ void BrowserManager::EnableKey(int key, bool enabled)
     LOG_INFO("[CEF] Key {} {}", key, enabled ? "enabled" : "disabled");
 }
 
-void BrowserManager::OnGameFocusGained()
-{
-    RestoreBrowserTextures();
-    RequestVisibleBrowsersRepaint();
-}
-
 void BrowserManager::OnGameFocusLost()
 {
     if (!CefCurrentlyOn(TID_UI))
@@ -1948,8 +1492,6 @@ void BrowserManager::OnGameFocusLost()
         CefPostTask(TID_UI, base::BindOnce(&BrowserManager::OnGameFocusLost, base::Unretained(this)));
         return;
     }
-
-    CancelDrag();
 
     auto* focused = GetFocusedBrowser();
     if (!focused || !focused->browser)
@@ -2000,7 +1542,6 @@ bool BrowserManager::IsFocusedTextInputActive() const
     if (!focus_ || focusedBrowserId_ < 0)
         return false;
 
-    BrowsersLock browsers_lock(browsers_mutex_);
     const auto browser = browsers_.find(focusedBrowserId_);
     return browser != browsers_.end()
         && browser->second
@@ -2036,7 +1577,6 @@ void BrowserManager::EmitCustomEscapeMenuVisibility()
 
     const bool visible = escape_menu_.IsCustomMenuOpen();
 
-    BrowsersLock browsers_lock(browsers_mutex_);
     for (const auto& [id, instance] : browsers_)
     {
         if (!instance || !instance->browser || !instance->browser->IsValid())
@@ -2065,7 +1605,6 @@ void BrowserManager::EmitCustomPlayerListVisibility()
 
     const bool visible = player_list_.IsCustomPlayerListOpen();
 
-    BrowsersLock browsers_lock(browsers_mutex_);
     for (const auto& [id, instance] : browsers_)
     {
         if (!instance || !instance->browser || !instance->browser->IsValid())
@@ -2123,12 +1662,7 @@ void BrowserManager::OnDeviceLost()
     // Stop CEF rendering during device reset
     // This prevents CEF from trying to update textures while they're invalid
     isCefUpdatesPaused_ = true;
-    screen_capture_.OnDeviceLost();
-
-    // Called from the Reset hook on the game thread.
-    ReleaseRetiredResources();
-    BrowsersLock browsers_lock(browsers_mutex_);
-
+    
     // Release all browser View resources (2D overlays)
     for (auto& [id, instance] : browsers_) 
     {
@@ -2152,8 +1686,6 @@ void BrowserManager::OnDeviceLost()
 
 void BrowserManager::OnDeviceReset(IDirect3DDevice9* device)
 {
-    BrowsersLock browsers_lock(browsers_mutex_);
-
     // Recreate all browser View resources (2D overlays)
     for (auto& [id, instance] : browsers_) 
     {
@@ -2174,180 +1706,59 @@ void BrowserManager::OnDeviceReset(IDirect3DDevice9* device)
         }
     }
     
-    // Resume CEF updates and restore the last known browser pixels immediately.
-    // Static pages may not produce another OnPaint after Alt+Tab/device reset,
-    // especially when another client plugin changes the D3D reset timing (like Samp Addons).
+    // Resume CEF updates
     isCefUpdatesPaused_ = false;
-    RestoreBrowserTextures();
-    RequestVisibleBrowsersRepaint();
+
+    // The textures were just recreated empty and CEF only repaints dirty regions.
+    ForceRepaintAll();
 }
 
-bool BrowserManager::StartDragging(int browserId,
-                                   CefRefPtr<CefBrowser> browser,
-                                   CefRefPtr<CefDragData> dragData,
-                                   cef_drag_operations_mask_t allowedOps,
-                                   int x,
-                                   int y)
+void BrowserManager::ForceRepaintAll()
 {
-    CEF_REQUIRE_UI_THREAD();
-    (void)x;
-    (void)y;
-    if (!browser || !dragData || allowedOps == DRAG_OPERATION_NONE)
-        return false;
+    // CEF only repaints dirty regions, so a static page (e.g. the chat) can stay blank after the
+    // game window was minimized / alt-tabbed / the device was reset, until its content changes.
+    std::vector<CefRefPtr<CefBrowser>> to_repaint;
+    for (auto& [id, instance] : browsers_)
+        if (instance && instance->browser && instance->visible)
+            to_repaint.push_back(instance->browser);
 
-    auto targetData = dragData->Clone();
-    if (!targetData)
-        return false;
-
-    // DragTargetDragEnter rejects file contents originating from StartDragging.
-    // The metadata and file names remain available after this call.
-    targetData->ResetFileContents();
-    CancelDrag();
-
-    drag_.browserId = browserId;
-    drag_.browser = std::move(browser);
-    drag_.data = std::move(targetData);
-    drag_.allowedOps = allowedOps;
-    drag_.currentOperation = DRAG_OPERATION_NONE;
-    drag_.lastX = last_mouse_x_.load();
-    drag_.lastY = last_mouse_y_.load();
-    drag_.entered = false;
-    drag_active_.store(true, std::memory_order_release);
-    return true;
-}
-
-void BrowserManager::UpdateDragCursor(int browserId, cef_drag_operations_mask_t operation)
-{
-    CEF_REQUIRE_UI_THREAD();
-    if (drag_.browserId == browserId && drag_.browser)
-        drag_.currentOperation = operation;
-}
-
-bool BrowserManager::HandleDragMouseMove(const CefMouseEvent& event)
-{
-    if (!drag_active_.load(std::memory_order_acquire))
-        return false;
-
-    CefPostTask(TID_UI, base::BindOnce(&BrowserManager::HandleDragMouseMoveOnUi,
-        base::Unretained(this), event));
-    return true;
-}
-
-void BrowserManager::HandleDragMouseMoveOnUi(CefMouseEvent event)
-{
-    CEF_REQUIRE_UI_THREAD();
-    if (!drag_.browser || !drag_.data)
+    if (to_repaint.empty())
         return;
 
-    drag_.lastX = event.x;
-    drag_.lastY = event.y;
-
-    auto host = drag_.browser->GetHost();
-    if (!host)
-    {
-        CancelDrag();
-        return;
-    }
-
-    if (!drag_.entered)
-    {
-        host->DragTargetDragEnter(drag_.data, event, drag_.allowedOps);
-        drag_.entered = true;
-    }
-    host->DragTargetDragOver(event, drag_.allowedOps);
-}
-
-bool BrowserManager::HandleDragMouseUp(const CefMouseEvent& event)
-{
-    if (!drag_active_.exchange(false, std::memory_order_acq_rel))
-        return false;
-
-    CefPostTask(TID_UI, base::BindOnce(&BrowserManager::HandleDragMouseUpOnUi,
-        base::Unretained(this), event));
-    return true;
-}
-
-void BrowserManager::HandleDragMouseUpOnUi(CefMouseEvent event)
-{
-    CEF_REQUIRE_UI_THREAD();
-    if (!drag_.browser || !drag_.data)
-        return;
-
-    auto host = drag_.browser->GetHost();
-    if (!host)
-    {
-        drag_ = DragState{};
-        return;
-    }
-
-    if (!drag_.entered)
-        host->DragTargetDragEnter(drag_.data, event, drag_.allowedOps);
-    host->DragTargetDragOver(event, drag_.allowedOps);
-    host->DragTargetDrop(event);
-
-    DragState completed = drag_;
-    completed.lastX = event.x;
-    completed.lastY = event.y;
-    drag_ = DragState{};
-    host->DragSourceEndedAt(event.x, event.y, completed.currentOperation);
-    host->DragSourceSystemDragEnded();
-}
-
-void BrowserManager::CancelDrag(int browserId)
-{
-    if (!CefCurrentlyOn(TID_UI))
-    {
-        drag_active_.store(false, std::memory_order_release);
-        CefPostTask(TID_UI, base::BindOnce(&BrowserManager::CancelDrag,
-            base::Unretained(this), browserId));
-        return;
-    }
-
-    if (!drag_.browser || (browserId != -1 && drag_.browserId != browserId))
-        return;
-
-    DragState cancelled = drag_;
-    drag_ = DragState{};
-    drag_active_.store(false, std::memory_order_release);
-
-    auto host = cancelled.browser->GetHost();
-    if (!host)
-        return;
-
-    if (cancelled.entered)
-        host->DragTargetDragLeave();
-    host->DragSourceEndedAt(cancelled.lastX, cancelled.lastY, DRAG_OPERATION_NONE);
-    host->DragSourceSystemDragEnded();
-}
-
-int BrowserManager::BeginMouseClick(MouseClickTracker& tracker, int browserId, int x, int y, bool explicitDoubleClick)
-{
-    const uint32_t now = static_cast<uint32_t>(GetMessageTime());
-    const uint32_t elapsed = now - tracker.lastDownTime;
-    const int maxX = std::max(1, GetSystemMetrics(SM_CXDOUBLECLK) / 2);
-    const int maxY = std::max(1, GetSystemMetrics(SM_CYDOUBLECLK) / 2);
-    const bool sameBrowser = tracker.browserId == browserId;
-    const bool closeInTime = tracker.lastDownTime != 0 && elapsed <= GetDoubleClickTime();
-    const bool closeInSpace = std::abs(x - tracker.lastDownX) <= maxX && std::abs(y - tracker.lastDownY) <= maxY;
-
-    if (explicitDoubleClick && sameBrowser)
-        tracker.sequenceCount = 2;
-    else if (sameBrowser && closeInTime && closeInSpace)
-        tracker.sequenceCount = std::min(tracker.sequenceCount + 1, 3);
-    else
-        tracker.sequenceCount = 1;
-
-    tracker.lastDownTime = now;
-    tracker.lastDownX = x;
-    tracker.lastDownY = y;
-    tracker.activeCount = tracker.sequenceCount;
-    tracker.browserId = browserId;
-    return tracker.activeCount;
+    CefPostTask(TID_UI, base::BindOnce([](std::vector<CefRefPtr<CefBrowser>> list) {
+        for (auto& b : list)
+            if (auto host = b->GetHost())
+            {
+                host->WasHidden(false);
+                host->WasResized();
+                host->Invalidate(PET_VIEW);
+            }
+    }, std::move(to_repaint)));
 }
 
 LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     bool native_ui_message_consumed = false;
+
+    // Coming back to the game (restore from minimize, alt-tab, desktop, window focus): repaint all.
+    switch (msg)
+    {
+    case WM_ACTIVATEAPP:
+    case WM_ACTIVATE:
+        if (wParam) ForceRepaintAll();
+        break;
+    case WM_SETFOCUS:
+        ForceRepaintAll();
+        break;
+    case WM_SIZE:
+        if (wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED) ForceRepaintAll();
+        break;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_RESTORE) ForceRepaintAll();
+        break;
+    default:
+        break;
+    }
 
     native_ui_message_consumed = escape_menu_.ConsumeWndProcMessage(msg, wParam, lParam) || native_ui_message_consumed;
 
@@ -2387,11 +1798,6 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
         }
     }
 
-    if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE || msg == WM_KILLFOCUS)
-    {
-        CancelDrag();
-    }
-
     auto* focused_inst = GetFocusedBrowser();
     if (!focused_inst || !focused_inst->browser)
         return false;
@@ -2400,64 +1806,67 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
     if (!host)
         return false;
 
+    // Hangul composition: show the syllable being typed inside the page, hide the Windows box.
+    if (msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_COMPOSITION || msg == WM_IME_ENDCOMPOSITION)
+    {
+        const bool textInput = (focus_ != nullptr) && focus_->IsTextInputFocused(focused_inst->id);
+        if (textInput)
+        {
+            if (msg == WM_IME_COMPOSITION)
+            {
+                if (lParam & GCS_RESULTSTR)
+                {
+                    const std::wstring done = ImeGetString(hwnd, GCS_RESULTSTR);
+                    if (!done.empty())
+                        host->ImeCommitText(CefString(done), CefRange(UINT32_MAX, UINT32_MAX), 0);
+                }
+                if (lParam & GCS_COMPSTR)
+                {
+                    const std::wstring comp = ImeGetString(hwnd, GCS_COMPSTR);
+                    if (!comp.empty())
+                    {
+                        CefCompositionUnderline ul;
+                        ul.range = CefRange(0, static_cast<int>(comp.size()));
+                        ul.color = 0xFF000000;
+                        ul.background_color = 0;
+                        ul.thick = false;
+                        const CefRange end(static_cast<int>(comp.size()), static_cast<int>(comp.size()));
+                        host->ImeSetComposition(CefString(comp), { ul }, CefRange(UINT32_MAX, UINT32_MAX), end);
+                    }
+                    else if (!(lParam & GCS_RESULTSTR))
+                    {
+                        host->ImeCancelComposition();
+                    }
+                }
+            }
+            return true;   // swallow: no native composition box, no WM_IME_CHAR / WM_CHAR duplicates
+        }
+    }
+
     switch (msg)
     {
         case WM_MOUSEMOVE:
         case WM_LBUTTONDOWN:
         case WM_LBUTTONUP:
-        case WM_LBUTTONDBLCLK:
         case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
-        case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONUP:
-        case WM_MBUTTONDBLCLK:
         case WM_MOUSEWHEEL:
         {
-            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            if (msg == WM_MOUSEWHEEL)
-                ScreenToClient(hwnd, &point);
-
             CefMouseEvent evt;
-            evt.x = point.x;
-            evt.y = point.y;
-            evt.modifiers = GetCefMouseEventFlags(wParam);
-            last_mouse_x_.store(evt.x);
-            last_mouse_y_.store(evt.y);
+            evt.x = GET_X_LPARAM(lParam);
+            evt.y = GET_Y_LPARAM(lParam);
+            evt.modifiers = GetCefEventFlags();
 
             if (msg == WM_MOUSEMOVE)
-            {
-                if (HandleDragMouseMove(evt))
-                    return true;
                 host->SendMouseMoveEvent(evt, false);
-            }
-            else if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK)
-            {
-                const int clickCount = BeginMouseClick(left_click_, focused_inst->id, evt.x, evt.y, msg == WM_LBUTTONDBLCLK);
-                host->SendMouseClickEvent(evt, MBT_LEFT, false, clickCount);
-                SetCapture(hwnd);
-            }
+            else if (msg == WM_LBUTTONDOWN)
+                host->SendMouseClickEvent(evt, MBT_LEFT, false, 1);
             else if (msg == WM_LBUTTONUP)
-            {
-                if (!HandleDragMouseUp(evt))
-                    host->SendMouseClickEvent(evt, MBT_LEFT, true, left_click_.activeCount);
-                if (GetCapture() == hwnd)
-                    ReleaseCapture();
-            }
-            else if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK)
-            {
-                const int clickCount = BeginMouseClick(right_click_, focused_inst->id, evt.x, evt.y, msg == WM_RBUTTONDBLCLK);
-                host->SendMouseClickEvent(evt, MBT_RIGHT, false, clickCount);
-            }
+                host->SendMouseClickEvent(evt, MBT_LEFT, true, 1);
+            else if (msg == WM_RBUTTONDOWN)
+                host->SendMouseClickEvent(evt, MBT_RIGHT, false, 1);
             else if (msg == WM_RBUTTONUP)
-                host->SendMouseClickEvent(evt, MBT_RIGHT, true, right_click_.activeCount);
-            else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK)
-            {
-                const int clickCount = BeginMouseClick(middle_click_, focused_inst->id, evt.x, evt.y, msg == WM_MBUTTONDBLCLK);
-                host->SendMouseClickEvent(evt, MBT_MIDDLE, false, clickCount);
-            }
-            else if (msg == WM_MBUTTONUP)
-                host->SendMouseClickEvent(evt, MBT_MIDDLE, true, middle_click_.activeCount);
+                host->SendMouseClickEvent(evt, MBT_RIGHT, true, 1);
             else if (msg == WM_MOUSEWHEEL)
                 host->SendMouseWheelEvent(evt, 0, GET_WHEEL_DELTA_WPARAM(wParam));
 
@@ -2472,6 +1881,33 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
             {
                 // T chat, TAB scoreboard, etc..
                 return false;
+            }
+
+            // Non-ASCII text (Hangul etc.): commit it as text instead of a key event.
+            // As a key event the UTF-16 code is truncated to its low byte somewhere in the key
+            // pipeline, so syllables like U+C608 (low byte 0x08) acted as Backspace.
+            if (msg == WM_CHAR && wParam > 0x7F)
+            {
+                static wchar_t pending_high = 0;
+                const wchar_t ch = static_cast<wchar_t>(wParam);
+                std::wstring text;
+                if (IS_HIGH_SURROGATE(ch))
+                {
+                    pending_high = ch;
+                    return true;
+                }
+                if (IS_LOW_SURROGATE(ch) && pending_high)
+                {
+                    text.push_back(pending_high);
+                    text.push_back(ch);
+                }
+                else
+                {
+                    text.push_back(ch);
+                }
+                pending_high = 0;
+                host->ImeCommitText(CefString(text), CefRange(UINT32_MAX, UINT32_MAX), 0);
+                return true;
             }
 
             CefKeyEvent evt;
@@ -2512,7 +1948,6 @@ void BrowserManager::SetPlayerStatsPolling(int browserId, bool enabled, int inte
     if (intervalMs <= 0)
         intervalMs = 50;
 
-    BrowsersLock browsers_lock(browsers_mutex_);
     auto& state = player_stats_poll_[browserId];
     state.enabled = enabled;
     state.intervalMs = static_cast<uint32_t>(intervalMs);
@@ -2525,12 +1960,7 @@ void BrowserManager::SetPlayerStatsPolling(int browserId, bool enabled, int inte
 
 void BrowserManager::TickGameData()
 {
-    if (!initialized_)
-        return;
-
-    BrowsersLock browsers_lock(browsers_mutex_);
-
-    if (player_stats_poll_.empty())
+    if (!initialized_ || player_stats_poll_.empty())
         return;
 
     const uint64_t now = ::GetTickCount64();
