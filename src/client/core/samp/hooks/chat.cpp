@@ -280,6 +280,44 @@ namespace
 
         return out;
     }
+
+    // Chat text from the game is always in the Windows ANSI code page (CP949 on Korean systems).
+    // EnsureUtf8ForCef() guesses, and a Hangul syllable whose two bytes happen to look like valid UTF-8
+    // (lead byte C2-C8, trail byte A1-BF) in a line with no other Korean text came out as Latin
+    // garbage such as "I" or "u". Convert as ANSI every time; plain ASCII is identical in both.
+    std::string AnsiToUtf8(const char* text)
+    {
+        if (!text || !*text)
+            return {};
+
+        std::string in(text);
+
+        // Diagnostic: proves this build is the one running. Logs the first few lines that contain
+        // non-ASCII bytes: ANSI code page, raw bytes, and the UTF-8 result.
+        static int s_logged = 0;
+        bool non_ascii = false;
+        for (unsigned char ch : in)
+            if (ch >= 0x80) { non_ascii = true; break; }
+
+        std::wstring wide;
+        if (!ConvertMultiByteToWide(::GetACP(), 0, in, wide))
+            return EnsureUtf8ForCef(in);
+
+        if (non_ascii && s_logged < 8)
+        {
+            ++s_logged;
+            std::string hex;
+            static const char* d = "0123456789ABCDEF";
+            for (unsigned char ch : in) { hex += d[ch >> 4]; hex += d[ch & 15]; hex += ' '; }
+            LOG_INFO("[ChatHook] AnsiToUtf8 v2 acp={} bytes={}", ::GetACP(), hex);
+        }
+
+        std::string out;
+        if (!ConvertWideToMultiByte(CP_UTF8, 0, wide, out))
+            return EnsureUtf8ForCef(in);
+
+        return out;
+    }
 }
 
 void ChatHook::QueueSubmit(const std::string& utf8_text)
@@ -356,8 +394,8 @@ void __fastcall ChatHook::Hook_AddEntry(void* pThis, void* _edx, int type, const
 
     ChatLine line;
     line.type = type;
-    line.text = EnsureUtf8ForCef(text ? text : "");
-    line.prefix = EnsureUtf8ForCef(prefix ? prefix : "");
+    line.text = AnsiToUtf8(text);
+    line.prefix = AnsiToUtf8(prefix);
     line.text_color = static_cast<int>(textColor & 0xFFFFFF);
     line.prefix_color = static_cast<int>(prefixColor & 0xFFFFFF);
 
@@ -424,6 +462,8 @@ void ChatHook::Tick()
             LOG_INFO("[ChatHook] IME {}", want ? "enabled" : "detached");
         }
     }
+
+    self->browser_.SyncAutoViewSizes();
 
     // Forget chat browsers that no longer exist.
     std::vector<int> ids;
