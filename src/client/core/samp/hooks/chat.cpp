@@ -10,6 +10,7 @@
 #include "system/logger.hpp"
 #include "shared/events.hpp"
 #include "utf8.hpp"
+#include "ime_state.hpp"
 
 #include <sampapi/0.3.DL-1/CChat.h>
 #include <sampapi/0.3.DL-1/CInput.h>
@@ -42,17 +43,62 @@ namespace
 
         using AssocFn = HANDLE(WINAPI*)(HWND, HANDLE);   // HIMC is a handle; avoids needing imm.h
         using AssocExFn = BOOL(WINAPI*)(HWND, HANDLE, DWORD);
+        using GetCtxFn = HANDLE(WINAPI*)(HWND);
+        using RelCtxFn = BOOL(WINAPI*)(HWND, HANDLE);
+        using GetConvFn = BOOL(WINAPI*)(HANDLE, LPDWORD, LPDWORD);
+        using SetConvFn = BOOL(WINAPI*)(HANDLE, DWORD, DWORD);
+        using GetOpenFn = BOOL(WINAPI*)(HANDLE);
+        using SetOpenFn = BOOL(WINAPI*)(HANDLE, BOOL);
         static auto assoc = reinterpret_cast<AssocFn>(::GetProcAddress(imm, "ImmAssociateContext"));
         static auto assocEx = reinterpret_cast<AssocExFn>(::GetProcAddress(imm, "ImmAssociateContextEx"));
+        static auto getCtx = reinterpret_cast<GetCtxFn>(::GetProcAddress(imm, "ImmGetContext"));
+        static auto relCtx = reinterpret_cast<RelCtxFn>(::GetProcAddress(imm, "ImmReleaseContext"));
+        static auto getConv = reinterpret_cast<GetConvFn>(::GetProcAddress(imm, "ImmGetConversionStatus"));
+        static auto setConv = reinterpret_cast<SetConvFn>(::GetProcAddress(imm, "ImmSetConversionStatus"));
+        static auto getOpen = reinterpret_cast<GetOpenFn>(::GetProcAddress(imm, "ImmGetOpenStatus"));
+        static auto setOpen = reinterpret_cast<SetOpenFn>(::GetProcAddress(imm, "ImmSetOpenStatus"));
+
+        // Remember the Hangul/English state so it survives detach -> attach
+        // (otherwise every re-open of the chat falls back to Hangul).
+        ImeState::State& st = ImeState::Get();
 
         if (enable)
         {
             if (assocEx)
                 assocEx(hwnd, nullptr, 0x0010 /* IACE_DEFAULT */);
+            st.attached = true;
+
+            if (st.have && getCtx && relCtx)
+            {
+                if (HANDLE himc = getCtx(hwnd))
+                {
+                    if (setOpen) setOpen(himc, st.open);
+                    if (setConv) setConv(himc, st.conv, st.sent);
+                    relCtx(hwnd, himc);
+                }
+            }
         }
-        else if (assoc)
+        else
         {
-            assoc(hwnd, nullptr);
+            if (getCtx && relCtx)
+            {
+                if (HANDLE himc = getCtx(hwnd))
+                {
+                    DWORD conv = 0, sent = 0;
+                    if (getConv && getConv(himc, &conv, &sent))
+                    {
+                        st.conv = conv;
+                        st.sent = sent;
+                        st.open = getOpen ? getOpen(himc) : TRUE;
+                        st.have = true;
+                    }
+                    relCtx(hwnd, himc);
+                }
+            }
+
+            if (assoc)
+                assoc(hwnd, nullptr);
+            st.attached = false;
         }
     }
 }
