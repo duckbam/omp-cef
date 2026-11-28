@@ -23,6 +23,7 @@
 #include "game_sa/CCamera.h"
 #include "shared/events.hpp"
 #include "utf8.hpp"
+#include "ime_state.hpp"
 
 static void ConfigureBrowserSettings(CefBrowserSettings& settings)
 {
@@ -1802,6 +1803,11 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
         break;
     }
 
+    // Han/Eng key while the IME is detached (chat closed): the IME can't see it, so remember
+    // the new language ourselves and the chat opens in it.
+    if (msg == WM_KEYDOWN && wParam == VK_HANGUL && !((static_cast<uint32_t>(lParam) >> 30) & 1u))
+        ImeState::ToggleLanguageWhileDetached();
+
     native_ui_message_consumed = escape_menu_.ConsumeWndProcMessage(msg, wParam, lParam) || native_ui_message_consumed;
 
     if (!IsFocusedTextInputActive())
@@ -1968,6 +1974,12 @@ LRESULT BrowserManager::OnWndProcMessage(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 evt.type = KEYEVENT_CHAR;
 
             host->SendKeyEvent(evt);
+
+            // The game must still see key-ups. The matching key-downs (W, Shift, ...) may have
+            // reached the game before the chat opened; if the key-up is swallowed here the game
+            // never learns the key was released and keeps the character running.
+            if (msg == WM_KEYUP)
+                return false;
 
             if (msg != WM_KEYUP)
             {
