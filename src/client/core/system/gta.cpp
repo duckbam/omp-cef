@@ -268,6 +268,13 @@ HWND Gta::FindHwndByProcess()
 
 std::string Gta::GetUserFilesPath()
 {
+    // NOTE: every consumer of this string (std::filesystem::path(std::string),
+    // std::ofstream, std::ifstream, ...) interprets narrow strings in the
+    // system ANSI code page (CP_ACP) on Windows, NOT UTF-8. Returning UTF-8
+    // here turned a Korean Documents folder into mojibake and broke
+    // the resource cache for every user with a non-ASCII Documents path.
+    // So return the path in the ANSI code page. If it is not representable
+    // there, fall back to the 8.3 short path.
     PWSTR pwszPath = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, NULL, &pwszPath)))
     {
@@ -275,13 +282,55 @@ std::string Gta::GetUserFilesPath()
         return "";
     }
 
-    int len = WideCharToMultiByte(CP_UTF8, 0, pwszPath, -1, nullptr, 0, nullptr, nullptr);
-    std::string path(len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, pwszPath, -1, &path[0], len, nullptr, nullptr);
+    std::wstring wide(pwszPath);
     CoTaskMemFree(pwszPath);
 
-    if (!path.empty() && path.back() == '\0')
-        path.pop_back();
+    auto toAnsi = [](const std::wstring& w, bool& lossy) -> std::string
+    {
+        lossy = false;
+        if (w.empty())
+            return {};
+
+        BOOL usedDefault = FALSE;
+        int len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), (int)w.size(),
+                                      nullptr, 0, nullptr, &usedDefault);
+        if (len <= 0)
+        {
+            lossy = true;
+            return {};
+        }
+
+        std::string out(len, '\0');
+        usedDefault = FALSE;
+        WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), (int)w.size(),
+                            &out[0], len, nullptr, &usedDefault);
+        lossy = usedDefault != FALSE;
+        return out;
+    };
+
+    bool lossy = false;
+    std::string path = toAnsi(wide, lossy);
+
+    if (lossy)
+    {
+        // Characters that the ANSI code page can't represent: use 8.3 short path.
+        wchar_t shortBuf[MAX_PATH * 2]{};
+        DWORD n = GetShortPathNameW(wide.c_str(), shortBuf, (DWORD)(sizeof(shortBuf) / sizeof(wchar_t)));
+        if (n > 0 && n < sizeof(shortBuf) / sizeof(wchar_t))
+        {
+            bool lossy2 = false;
+            std::string shortPath = toAnsi(shortBuf, lossy2);
+            if (!lossy2 && !shortPath.empty())
+                path = std::move(shortPath);
+        }
+        else
+        {
+            LOG_ERROR("[GTA] Documents path has characters outside the ANSI code page and no short path is available.");
+        }
+    }
+
+    if (path.empty())
+        return "";
 
     try {
         std::filesystem::path result = path;
