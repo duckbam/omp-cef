@@ -1,5 +1,6 @@
 ﻿#include "resource_manager.hpp"
 
+#include <windows.h>
 #include <filesystem>
 #include <fstream>
 
@@ -311,8 +312,29 @@ bool ResourceManager::LoadPakIntoVFS(const std::string& resourceName, const std:
 		return false;
 	}
 
+	// pakPath is in the ANSI code page (same as ofstream/ifstream/filesystem use),
+	// but miniz on Windows treats file names as UTF-8. Convert before opening,
+	// otherwise any non-ASCII path (e.g. Korean "Documents") fails to open.
+	std::string pakPathUtf8 = pakPath;
+	{
+		int wlen = MultiByteToWideChar(CP_ACP, 0, pakPath.c_str(), -1, nullptr, 0);
+		if (wlen > 0)
+		{
+			std::wstring wide(wlen, L'\0');
+			MultiByteToWideChar(CP_ACP, 0, pakPath.c_str(), -1, &wide[0], wlen);
+			int ulen = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+			if (ulen > 0)
+			{
+				std::string utf8(ulen, '\0');
+				WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], ulen, nullptr, nullptr);
+				utf8.resize(ulen - 1);
+				pakPathUtf8 = std::move(utf8);
+			}
+		}
+	}
+
 	mz_zip_archive zip{};
-	if (!mz_zip_reader_init_file(&zip, pakPath.c_str(), 0))
+	if (!mz_zip_reader_init_file(&zip, pakPathUtf8.c_str(), 0))
 	{
 		LOG_ERROR("[ResourceManager] Failed to open PAK file: {}", pakPath);
 		return false;
